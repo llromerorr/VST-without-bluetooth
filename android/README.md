@@ -1,26 +1,19 @@
-# WOB Android App (Android 10+ / API 29+)
+# WOB 3.0 - App Android (Universal: Android 5.0 a 15+)
 
-Audio sender application for **WOB (Without Bluetooth)**. Captures pure internal digital audio from any app (YouTube, Spotify, dance rehearsals, etc.) and transmits it over UDP Wi-Fi directly to the WOB VST plugin in your DAW with ultra-low latency.
+Aplicación emisora para **WOB 3.0 (Without Bluetooth)**. Captura el flujo de audio digital interno de cualquier reproductor (YouTube, Spotify, pistas de ensayo) y lo envía en tiempo real por Wi-Fi UDP a REAPER / DAW.
 
-## Key Features
-- **Internal Digital Audio Capture:** Powered by Android 10's official `AudioPlaybackCaptureConfiguration` API.
-- **Physical Speaker Muting:** Routes digital PCM directly to the network while leaving the phone's physical hardware speaker silent.
-- **Dual Volume Control:**
-  1. **In-App Studio Fader (SeekBar):** Smooth 0-100% digital PCM gain slider.
-  2. **Notification Quick Actions:** `[-] Bajar` and `[+] Subir` buttons in the persistent background notification bar, allowing volume adjustments on the fly without exiting YouTube or your music app.
-- **Zero Configuration:** UDP broadcast beacon on port 58200 auto-locates your DAW running the WOB VST on the local Wi-Fi.
-- **Anti-Sleep / Battery Optimization Immunity:**
-  - Foreground service with persistent notification.
-  - CPU `WakeLock` and `WifiLock.WIFI_MODE_FULL_HIGH_PERF` to ensure rock-solid streaming even with the phone screen locked.
-  - Battery optimization whitelist request to prevent Samsung / Android power management from dropping audio packets.
+## Novedades en la Versión 3.0
+- **Compatibilidad Universal Total:** Compatible desde Android 5.0 (Lollipop) hasta Android 15+ (`minSdkVersion=21`, `targetSdkVersion=34`).
+- **Soporte Completo para Android 14+:** Registro nativo de `MediaProjection.Callback` y permisos de primer plano de proyección de medios.
+- **MulticastLock de Hardware:** Habilita el paso de paquetes UDP de broadcast en procesadores MediaTek, Transsion (Tecno/Infinix), Qualcomm y Exynos.
+- **Barrido Rápido de Subred:** Descubrimiento automático ultra-rápido en menos de 20 ms sin importar la subred del router (`192.168.0.x`, `192.168.1.x`, `10.0.0.x`, etc.).
+- **Controles de Volumen en Notificación:** Botones fijos `[-]` y `[+]` siempre visibles en la notificación compacta (`MediaStyle`) sin necesidad de desplegarla.
+- **Fader de Estudio en Pantalla:** Deslizador de 0 a 100% que escala la ganancia PCM digital sin tocar el volumen del parlante físico.
+- **Persistencia en Segundo Plano:** `WakeLock`, `WifiLock` de alto rendimiento y exención de optimización de batería.
 
-## Build Requirements
-- Android SDK Build-Tools (v34.0.0+)
-- Android Platform `android-34`
-- JDK 8 or JDK 17
-
-To build the APK:
+## Compilación
+Requiere **Android SDK Build-Tools** y **JDK**:
 ```cmd
 build_apk.bat
 ```
-Output will be placed in `bin\WOB.apk`.
+Generará `bin\WOB-3.0.apk` y `bin\WOB.apk`.

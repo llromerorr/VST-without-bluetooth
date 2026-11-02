@@ -1,30 +1,25 @@
-# WOB VST Plugin (Windows 64-bit)
+# WOB 3.0 - VST Plugin (Windows 64-bit)
 
-Receiver VST2 plugin for digital audio streaming over UDP from Android devices running the **WOB** app.
+Plugin receptor VST2 de audio digital sobre UDP de ultra-baja latencia para DAWs (REAPER, Ableton, FL Studio, etc.), conectado a teléfonos Android mediante la app **WOB 3.0**.
 
-## Features
-- **Ultra-Low Latency:** 25ms elastic jitter buffer tuned for instant audio playback.
-- **Dynamic Resampling:** High-precision real-time linear interpolation resampler converting 48,000 Hz (Android hardware) to any DAW host sample rate (e.g., 44,100 Hz, 48,000 Hz, 96,000 Hz) with zero clicks or pitch drift.
-- **Auto-Discovery:** Automatically responds to broadcast beacon pings from phones on the local network (UDP Port `58200`).
-- **Multi-Client Summing:** Mixes audio from multiple phones simultaneously with clean clipping prevention.
-- **Soft Limiter:** Built-in tanh-style soft saturation ceiling to prevent harsh digital clipping.
-- **Minimal Native Win32 UI:** Real-time VU meter, client counter, sample rate indicator, and buffer health monitor.
+## Novedades en la Versión 3.0
+- **Compensación Proporcional de Clock Drift:** Rastreo continuo de la deriva de reloj entre el teléfono y la tarjeta de sonido de la PC. El colchón de audio se mantiene permanentemente estabilizado en ~35 ms sin vaciarse ni desbordarse.
+- **Ocultamiento Suave de Jitter:** Ante micro-retrasos de paquetes Wi-Fi causados por el router, el plugin aplica un desvanecimiento suave en lugar de cortar a silencio forzado.
+- **Autodescubrimiento Instantáneo:** Responde inmediatamente al barrido de subred UDP en el puerto `58200`.
+- **Suma y Mezcla Multidispositivo:** Permite conectar múltiples teléfonos en simultáneo sumando sus canales con limitador suave anti-clipping.
+- **Interfaz Nativa Win32:** Medidores de pico VU en tiempo real, contador de teléfonos conectados y estado de enlace.
 
-## Build from Source
-Requirements:
-- Windows 64-bit
-- GCC (MinGW-w64 or MSYS2)
-
-To compile:
+## Compilación
+Requiere **GCC** (MinGW-w64 o MSYS2):
 ```cmd
 build_vst.bat
 ```
-Output will be generated in `bin\WOB.dll`.
+Generará `bin\WOB-3.0.dll` y `bin\WOB.dll`.
 
-## Installation
-1. Copy `WOB.dll` into your VST plugin folder:
-   - `C:\Program Files\VSTPlugins\` or
+## Instalación
+1. Copia `WOB-3.0.dll` (o `WOB.dll`) en tu carpeta de VSTs:
+   - `C:\Program Files\VSTPlugins\` o
    - `C:\Program Files\REAPER (x64)\Plugins\FX\`
-2. In REAPER (or your DAW):
-   - Go to `Options` -> `Preferences` -> `VST` -> `Re-scan`.
-   - Insert `WOB` as a virtual instrument / effect on any track.
+2. En REAPER:
+   - Ve a `Options` -> `Preferences` -> `VST` -> `Re-scan`.
+   - Inserta `WOB 3.0` en cualquier pista.

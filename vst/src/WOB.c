@@ -393,7 +393,7 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                                           CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
             HFONT oldFont = (HFONT)SelectObject(memDC, hFontTitle);
             SetTextColor(memDC, RGB(0, 220, 200));
-            TextOutA(memDC, 16, 8, "WOB", 3);
+            TextOutA(memDC, 16, 8, "WOB 3.0", 7);
 
             HFONT hFontSmall = CreateFontA(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -408,9 +408,9 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (count > 0) {
                 dotBrush = CreateSolidBrush(RGB(46, 213, 115));
                 if (count == 1) {
-                    sprintf(statusText, "CONECTADO: 1 teléfono activo (En vivo)");
+                    sprintf(statusText, "CONECTADO: 1 telÃ©fono activo (En vivo)");
                 } else {
-                    sprintf(statusText, "CONECTADO: %d teléfonos activos (Colaborativo)", count);
+                    sprintf(statusText, "CONECTADO: %d telÃ©fonos activos (Colaborativo)", count);
                 }
                 SetTextColor(memDC, RGB(46, 213, 115));
             } else {
@@ -553,9 +553,9 @@ static intptr_t dispatcher(struct AEffect* e, int32_t op, int32_t idx, intptr_t 
                 state->hwndEditor = NULL;
             }
             return 0;
-        case 45: if (ptr) { lstrcpyA((char*)ptr, "WOB"); return 1; } break;
+        case 45: if (ptr) { lstrcpyA((char*)ptr, "WOB 3.0"); return 1; } break;
         case 47: if (ptr) { lstrcpyA((char*)ptr, "WOB Audio"); return 1; } break;
-        case 48: if (ptr) { lstrcpyA((char*)ptr, "WOB"); return 1; } break;
+        case 48: if (ptr) { lstrcpyA((char*)ptr, "WOB 3.0"); return 1; } break;
         case 49: return 3000;
         case 58: return 2400;
     }

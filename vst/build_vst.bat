@@ -1,6 +1,6 @@
 @echo off
 echo ========================================================
-echo   WOB (Without Bluetooth) - VST2 64-bit Build Script
+echo   WOB 3.0 (Without Bluetooth) - VST2 64-bit Build Script
 echo ========================================================
 
 where gcc >nul 2>nul
@@ -12,15 +12,16 @@ if %ERRORLEVEL% NEQ 0 (
 
 if not exist bin mkdir bin
 
-echo Compiling src/WOB.c into bin/WOB.dll ...
+echo Compiling src/WOB.c into bin/WOB-3.0.dll ...
 gcc -shared -O3 -Wall -Wextra ^
-    -o "bin\WOB.dll" ^
+    -o "bin\WOB-3.0.dll" ^
     "src\WOB.c" ^
     -lws2_32 -lgdi32 -luser32 -s
 
 if %ERRORLEVEL% EQU 0 (
-    echo [SUCCESS] Build completed: bin\WOB.dll
-    echo Copy bin\WOB.dll to your VST plugin folder (e.g. C:\Program Files\VSTPlugins\^)
+    copy /y "bin\WOB-3.0.dll" "bin\WOB.dll" >nul
+    echo [SUCCESS] Build completed: bin\WOB-3.0.dll
+    echo Copy bin\WOB-3.0.dll to your VST plugin folder (e.g. C:\Program Files\VSTPlugins\^)
 ) else (
     echo [ERROR] Compilation failed.
     exit /b 1
