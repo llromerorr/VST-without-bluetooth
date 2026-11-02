@@ -141,6 +141,11 @@ public class AudioCaptureService extends Service {
         upIntent.setAction(ACTION_VOL_UP);
         PendingIntent piUp = PendingIntent.getService(this, 2, upIntent, flags);
 
+        // Intent to open MainActivity
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent piOpen = PendingIntent.getActivity(this, 0, openIntent, flags);
+
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             builder = new Notification.Builder(this, CHANNEL_ID);
@@ -148,14 +153,22 @@ public class AudioCaptureService extends Service {
             builder = new Notification.Builder(this);
         }
 
-        return builder
-                .setContentTitle("WOB: En vivo a REAPER")
-                .setContentText("Volumen: " + currentVolumePercent + "% (Toca - / +)")
+        builder.setContentTitle("WOB: En vivo a REAPER")
+                .setContentText("Volumen: " + currentVolumePercent + "%")
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .addAction(android.R.drawable.ic_media_previous, "[-] Bajar", piDown)
                 .addAction(android.R.drawable.ic_media_next, "[+] Subir", piUp)
-                .setOngoing(true)
-                .build();
+                .setContentIntent(piOpen)
+                .setOngoing(true);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            builder.setVisibility(Notification.VISIBILITY_PUBLIC);
+            Notification.MediaStyle mediaStyle = new Notification.MediaStyle();
+            mediaStyle.setShowActionsInCompactView(0, 1);
+            builder.setStyle(mediaStyle);
+        }
+
+        return builder.build();
     }
 
     private void startForegroundNotification() {

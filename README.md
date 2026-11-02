@@ -1,6 +1,7 @@
 # WOB (Without Bluetooth) 🚀
 ### Ultra-Low Latency Wi-Fi Audio Streaming from Android to REAPER / DAWs
 
+[![Release](https://img.shields.io/github/v/release/llromerorr/VST-without-bluetooth?color=blue&label=Latest%20Release)](https://github.com/llromerorr/VST-without-bluetooth/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Android%2010%2B-blue.svg)](#)
 [![Format](https://img.shields.io/badge/Format-VST2%2064--bit-orange.svg)](#)
 [![Latency](https://img.shields.io/badge/Latency-~25ms%20Ultra--Low-brightgreen.svg)](#)
@@ -10,14 +11,16 @@
 
 ---
 
-## 📥 Descargas Rápidas (Listo para Usar)
+## 📥 Descargas Oficiales (GitHub Releases)
 
-No necesitas compilar nada si solo quieres usarlo de inmediato. Los binarios listos para producción están disponibles en la carpeta [`releases/`](releases/):
+Descarga los binarios precompilados directamente desde la [**Sección de Releases de GitHub**](https://github.com/llromerorr/VST-without-bluetooth/releases):
 
 | Componente | Archivo de Descarga | Descripción |
 | :--- | :--- | :--- |
-| **VST Plugin (Windows 64-bit)** | [👉 **Descargar WOB.dll**](releases/WOB.dll?raw=true) | Plugin VST2 de 64 bits para REAPER u otro DAW en Windows. |
-| **App Móvil (Android 10+)** | [👉 **Descargar WOB.apk**](releases/WOB.apk?raw=true) | Aplicación Android con autodescubrimiento y fader de volumen. |
+| **VST Plugin (Windows 64-bit)** | [👉 **Descargar WOB.dll**](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB.dll) | Plugin VST2 de 64 bits para REAPER u otro DAW en Windows. |
+| **App Móvil (Android 10+)** | [👉 **Descargar WOB.apk**](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB.apk) | Aplicación Android con autodescubrimiento y fader de volumen. |
+
+*(También puedes ver todas las versiones y notas de la versión en [Releases](https://github.com/llromerorr/VST-without-bluetooth/releases).)*
 
 ---
 
@@ -28,7 +31,7 @@ No necesitas compilar nada si solo quieres usarlo de inmediato. Los binarios lis
 * **🔇 Silencio en el Teléfono:** Utiliza la API oficial `AudioPlaybackCapture` de Android 10+ para capturar el flujo digital puro a 48 kHz. El parlante físico de tu celular permanece en silencio mientras todo el sonido sale por los monitores de estudio de tu PC.
 * **🎚️ Control de Volumen Dual:**
   * **Fader de Estudio en Pantalla:** Control deslizante (0-100%) con ganancia digital limpia en coma flotante.
-  * **Botones en Notificación:** Controles rápidos `[-] Bajar` y `[+] Subir` en la barra de notificaciones para ajustar el volumen sin pausar ni salir de YouTube o Spotify.
+  * **Botones en Notificación (Vista Compacta):** Controles `[-] Bajar` y `[+] Subir` visibles permanentemente en la notificación tipo reproductor multimedia (`MediaStyle`), listos para presionar sin tener que desplegar la notificación ni salir de YouTube o Spotify.
 * **🛡️ Resampleador Lineal Dinámico Anti-Clipping:** El hardware de Android envía audio a 48,000 Hz mientras que la mayoría de los DAWs operan a 44,100 Hz. WOB incluye un resampleador lineal continuo en tiempo real que previene clics digitales, artefactos y desbordamientos de buffer.
 * **👥 Mezcla Multi-Dispositivo (Multi-Client Summing):** Permite conectar varios teléfonos al mismo tiempo a la misma pista del DAW. Cada teléfono se suma y mezcla limpiamente con limitador suave (*soft saturation*) integrado.
 * **🔋 A Prueba de Suspensión (Samsung / Android Background Persistence):** Servicio en primer plano (*Foreground Service*), `WakeLock` de CPU, `WifiLock` de alto rendimiento y bypass de optimización de batería para evitar que el teléfono apague la conexión al bloquear la pantalla.
@@ -38,7 +41,7 @@ No necesitas compilar nada si solo quieres usarlo de inmediato. Los binarios lis
 ## 🎬 Guía Rápida de Instalación y Uso
 
 ### 1. En la Computadora (REAPER / DAW)
-1. Descarga [`WOB.dll`](releases/WOB.dll?raw=true).
+1. Descarga [`WOB.dll`](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB.dll) desde Releases.
 2. Cópialo a tu carpeta habitual de VSTs, por ejemplo:
    ```text
    C:\Program Files\VSTPlugins\
@@ -55,12 +58,12 @@ No necesitas compilar nada si solo quieres usarlo de inmediato. Los binarios lis
 ---
 
 ### 2. En el Teléfono Android
-1. Descarga e instala [`WOB.apk`](releases/WOB.apk?raw=true).
+1. Descarga e instala [`WOB.apk`](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB.apk) desde Releases.
 2. Abre la app **WOB**.
 3. Toca el botón central **CONECTAR**.
 4. Android te pedirá confirmación para iniciar la captura de audio (*"Iniciar ahora"*).
 5. ¡Listo! Abre YouTube, Spotify o cualquier reproductor: el sonido se escuchará instantáneamente a través de tu DAW en la PC.
-6. Puedes graduar el volumen con el fader en la app o usando los botones `[-]` y `[+]` de la notificación mientras reproduces tu música.
+6. Ajusta el volumen desde la app o directamente desde los botones `[-]` y `[+]` siempre visibles en la notificación de tu teléfono.
 
 ---
 
@@ -96,9 +99,17 @@ flowchart LR
 
 ---
 
-## 🛠️ Compilación desde el Código Fuente
+## 🛠️ Estructura del Código y Compilación
 
-Si deseas modificar o compilar los proyectos por tu cuenta:
+```text
+VST-without-bluetooth/
+├── vst/
+│   ├── src/WOB.c           # Código fuente C del plugin VST2
+│   └── build_vst.bat       # Script de compilación GCC
+└── android/
+    ├── src/main/           # Código fuente Java y recursos Android
+    └── build_apk.bat       # Script de compilación APK
+```
 
 ### Compilar el Plugin VST (`vst/`)
 Requiere **GCC** (MinGW-w64 o MSYS2):
