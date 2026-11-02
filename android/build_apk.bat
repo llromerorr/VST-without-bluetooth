@@ -37,17 +37,17 @@ echo [1/6] Compiling resources...
 "%AAPT2%" compile --dir "%APP_DIR%src\main\res" -o "%BUILD_DIR%\resources.zip"
 if %ERRORLEVEL% NEQ 0 goto err
 
-echo [2/6] Linking APK...
-"%AAPT2%" link -I "%PLATFORM%" --manifest "%APP_DIR%src\main\AndroidManifest.xml" --java "%GEN_DIR%" -o "%BUILD_DIR%\base.apk" "%BUILD_DIR%\resources.zip" --auto-add-overlay
+echo [2/6] Linking APK (minSdk 21, targetSdk 34)...
+"%AAPT2%" link -I "%PLATFORM%" --manifest "%APP_DIR%src\main\AndroidManifest.xml" --min-sdk-version 21 --target-sdk-version 34 --version-code 2 --version-name "1.0.2" --java "%GEN_DIR%" -o "%BUILD_DIR%\base.apk" "%BUILD_DIR%\resources.zip" --auto-add-overlay
 if %ERRORLEVEL% NEQ 0 goto err
 
 echo [3/6] Compiling Java sources...
 javac -cp "%PLATFORM%" -d "%CLASSES_DIR%" -source 8 -target 8 "%GEN_DIR%\com\antigravity\netaudio\R.java" "%APP_DIR%src\main\java\com\antigravity\netaudio\AudioCaptureService.java" "%APP_DIR%src\main\java\com\antigravity\netaudio\MainActivity.java"
 if %ERRORLEVEL% NEQ 0 goto err
 
-echo [4/6] Converting to DEX...
+echo [4/6] Converting to DEX (minApi 21)...
 pushd "%CLASSES_DIR%"
-call "%D8%" --lib "%PLATFORM%" --output "%BUILD_DIR%" com\antigravity\netaudio\*.class
+call "%D8%" --min-api 21 --lib "%PLATFORM%" --output "%BUILD_DIR%" com\antigravity\netaudio\*.class
 popd
 if %ERRORLEVEL% NEQ 0 goto err
 
@@ -56,9 +56,9 @@ pushd "%BUILD_DIR%"
 jar -uf "base.apk" "classes.dex"
 popd
 
-echo [6/6] Zipaligning and Signing...
+echo [6/6] Zipaligning and Signing (v1, v2, v3)...
 "%ZIPALIGN%" -f -p 4 "%BUILD_DIR%\base.apk" "%BUILD_DIR%\aligned.apk"
-call "%APKSIGNER%" sign --ks "%DEBUG_KEYSTORE%" --ks-pass pass:android --key-pass pass:android --out "%APP_DIR%bin\WOB.apk" "%BUILD_DIR%\aligned.apk"
+call "%APKSIGNER%" sign --ks "%DEBUG_KEYSTORE%" --ks-pass pass:android --key-pass pass:android --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --out "%APP_DIR%bin\WOB.apk" "%BUILD_DIR%\aligned.apk"
 
 if %ERRORLEVEL% EQU 0 (
     echo.

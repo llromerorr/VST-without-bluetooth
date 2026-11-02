@@ -72,8 +72,16 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Request audio permission if needed
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        // Request audio and notification permissions (Android 13+ support)
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ||
+                checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{
+                        Manifest.permission.RECORD_AUDIO,
+                        "android.permission.POST_NOTIFICATIONS"
+                }, REQUEST_AUDIO_PERMISSION);
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_AUDIO_PERMISSION);
             }

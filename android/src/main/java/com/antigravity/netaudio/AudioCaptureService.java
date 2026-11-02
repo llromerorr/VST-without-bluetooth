@@ -323,24 +323,26 @@ public class AudioCaptureService extends Service {
         final int encoding = AudioFormat.ENCODING_PCM_16BIT;
 
         try {
-            AudioPlaybackCaptureConfiguration config = new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .build();
-
             int minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding);
             int bufSize = Math.max(minBuf, 48000 * 2 * 2 / 10);
 
-            audioRecord = new AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(config)
-                    .setAudioFormat(new AudioFormat.Builder()
-                            .setEncoding(encoding)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(channelConfig)
-                            .build())
-                    .setBufferSizeInBytes(bufSize)
-                    .build();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mediaProjection != null) {
+                audioRecord = PlaybackCaptureCompat.createRecord(mediaProjection, sampleRate, channelConfig, encoding, bufSize);
+            } else {
+                audioRecord = new AudioRecord(
+                        android.media.MediaRecorder.AudioSource.MIC,
+                        sampleRate,
+                        channelConfig,
+                        encoding,
+                        bufSize
+                );
+            }
+
+            if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioRecord failed to initialize");
+                stopSelf();
+                return;
+            }
 
             udpSocket = new DatagramSocket();
             udpSocket.setSendBufferSize(256 * 1024);
@@ -448,5 +450,26 @@ public class AudioCaptureService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    @android.annotation.TargetApi(Build.VERSION_CODES.Q)
+    private static class PlaybackCaptureCompat {
+        static AudioRecord createRecord(MediaProjection mediaProjection, int sampleRate, int channelConfig, int encoding, int bufSize) {
+            AudioPlaybackCaptureConfiguration config = new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build();
+
+            return new AudioRecord.Builder()
+                    .setAudioPlaybackCaptureConfig(config)
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setEncoding(encoding)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(channelConfig)
+                            .build())
+                    .setBufferSizeInBytes(bufSize)
+                    .build();
+        }
     }
 }
