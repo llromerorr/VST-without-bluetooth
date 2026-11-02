@@ -156,8 +156,8 @@ public class AudioCaptureService extends Service {
         builder.setContentTitle("WOB: En vivo a REAPER")
                 .setContentText("Volumen: " + currentVolumePercent + "%")
                 .setSmallIcon(android.R.drawable.ic_media_play)
-                .addAction(android.R.drawable.ic_media_previous, "[-] Bajar", piDown)
-                .addAction(android.R.drawable.ic_media_next, "[+] Subir", piUp)
+                .addAction(R.drawable.ic_minus, "-", piDown)
+                .addAction(R.drawable.ic_plus, "+", piUp)
                 .setContentIntent(piOpen)
                 .setOngoing(true);
 
