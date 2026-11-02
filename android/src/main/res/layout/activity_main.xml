@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:background="#121316"
+    android:padding="28dp">
+
+    <!-- App Title -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="WOB"
+        android:textColor="#00D2D2"
+        android:textSize="44sp"
+        android:textStyle="bold"
+        android:letterSpacing="0.08" />
+
+    <!-- Subtitle -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Audio en vivo a REAPER sin Bluetooth"
+        android:textColor="#888899"
+        android:textSize="13sp"
+        android:layout_marginBottom="40dp" />
+
+    <!-- Big Center Power Button -->
+    <Button
+        android:id="@+id/btnPower"
+        android:layout_width="200dp"
+        android:layout_height="200dp"
+        android:background="#1E2026"
+        android:textColor="#00D2D2"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:text="CONECTAR"
+        android:elevation="8dp"
+        android:layout_marginBottom="35dp" />
+
+    <!-- Studio Fader / Volume Slider -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginBottom="30dp"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp">
+
+        <TextView
+            android:id="@+id/txtVolume"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="VOLUMEN: 100%"
+            android:textColor="#00D2D2"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="10dp" />
+
+        <SeekBar
+            android:id="@+id/seekVolume"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="100" />
+    </LinearLayout>
+
+    <!-- Status -->
+    <TextView
+        android:id="@+id/txtStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Toca el boton para conectar"
+        android:textColor="#A0A0B0"
+        android:textSize="15sp"
+        android:textStyle="bold" />
+
+</LinearLayout>
