@@ -290,11 +290,11 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
             }
         }
 
-        // Clock Drift Micro-adjustment (tight 25ms zone)
-        double driftFactor = 1.0;
-        int diff = (int)available - (int)targetFrames;
-        if (diff > 480) driftFactor = 1.002;
-        else if (diff < -480) driftFactor = 0.998;
+        // Continuous proportional clock drift steering (locks buffer around target cushion)
+        double diff = (double)available - (double)targetFrames;
+        double driftFactor = 1.0 + (diff / (double)targetFrames) * 0.005;
+        if (driftFactor > 1.01) driftFactor = 1.01;
+        if (driftFactor < 0.99) driftFactor = 0.99;
 
         double step = (INPUT_SAMPLE_RATE / (double)hostRate) * driftFactor;
 
@@ -326,8 +326,15 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
                     client->readPos -= (double)RING_BUFFER_SIZE;
                 }
             } else {
-                client->prebuffering = true;
-                client->fadeVolume = 0.0f;
+                // Buffer momentarily starved: gently decay volume without hard cutting to silence
+                if (client->fadeVolume > 0.0f) {
+                    client->fadeVolume -= (1.0f / 128.0f);
+                    if (client->fadeVolume < 0.0f) client->fadeVolume = 0.0f;
+                }
+                // Only enter hard prebuffering if starved for > 150ms
+                if ((now - client->lastSeenTick) > 150) {
+                    client->prebuffering = true;
+                }
             }
         }
     }
@@ -401,9 +408,9 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (count > 0) {
                 dotBrush = CreateSolidBrush(RGB(46, 213, 115));
                 if (count == 1) {
-                    sprintf(statusText, "CONECTADO: 1 teléfono activo (En vivo)");
+                    sprintf(statusText, "CONECTADO: 1 telÃ©fono activo (En vivo)");
                 } else {
-                    sprintf(statusText, "CONECTADO: %d teléfonos activos (Colaborativo)", count);
+                    sprintf(statusText, "CONECTADO: %d telÃ©fonos activos (Colaborativo)", count);
                 }
                 SetTextColor(memDC, RGB(46, 213, 115));
             } else {
@@ -571,7 +578,7 @@ __declspec(dllexport) struct AEffect* VSTPluginMain(audioMasterCallback audioMas
     memset(&g_state, 0, sizeof(g_state));
     g_state.hostSampleRate = 44100.0f;
     g_state.masterGain = 1.0f;
-    g_state.targetBufferMs = 25.0f; // Ultra-Low Latency (~25ms, almost instant!)
+    g_state.targetBufferMs = 35.0f; // Ultra-Low Latency (~25ms, almost instant!)
 
     memset(&g_effect, 0, sizeof(g_effect));
     g_effect.magic = kEffectMagic;

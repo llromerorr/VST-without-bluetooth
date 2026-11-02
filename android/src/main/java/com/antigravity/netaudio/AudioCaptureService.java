@@ -18,19 +18,21 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.os.Process;
 import android.util.Log;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Enumeration;
 
 public class AudioCaptureService extends Service {
     private static final String TAG = "WOB";
@@ -63,6 +65,7 @@ public class AudioCaptureService extends Service {
 
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
+    private WifiManager.MulticastLock multicastLock;
     private NotificationManager notificationManager;
 
     @Override
@@ -202,6 +205,16 @@ public class AudioCaptureService extends Service {
             return;
         }
 
+        // Android 14+ requires a Callback registered on mediaProjection before use
+        try {
+            mediaProjection.registerCallback(new MediaProjection.Callback() {
+                @Override
+                public void onStop() {
+                    stopCapturing();
+                }
+            }, new Handler(Looper.getMainLooper()));
+        } catch (Exception ignored) {}
+
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null) {
@@ -217,6 +230,11 @@ public class AudioCaptureService extends Service {
                 }
                 wifiLock = wm.createWifiLock(wifiMode, "WOB:WifiLock");
                 wifiLock.acquire();
+
+                // MulticastLock allows UDP broadcasts to pass through on MediaTek/Tecno/Xiaomi chips
+                multicastLock = wm.createMulticastLock("WOB:MulticastLock");
+                multicastLock.setReferenceCounted(false);
+                multicastLock.acquire();
             }
         } catch (Exception ignored) {}
 
@@ -230,20 +248,41 @@ public class AudioCaptureService extends Service {
         workerThread.start();
     }
 
+    private String getLocalSubnetPrefix() {
+        try {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
+                NetworkInterface intf = en.nextElement();
+                for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements();) {
+                    InetAddress inetAddress = enumIpAddr.nextElement();
+                    if (!inetAddress.isLoopbackAddress() && inetAddress instanceof Inet4Address) {
+                        String ip = inetAddress.getHostAddress();
+                        int lastDot = ip.lastIndexOf('.');
+                        if (lastDot > 0) {
+                            return ip.substring(0, lastDot + 1); // e.g. "192.168.0."
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return "192.168.0.";
+    }
+
     private String discoverTargetPC() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String lastKnownIp = prefs.getString(KEY_LAST_IP, "192.168.0.116");
+        String subnetPrefix = getLocalSubnetPrefix();
 
         try {
             DatagramSocket discoverySock = new DatagramSocket();
             discoverySock.setBroadcast(true);
-            discoverySock.setSoTimeout(400);
+            discoverySock.setSoTimeout(500);
 
             byte[] discoverMsg = "NA_DISCOVER".getBytes();
 
+            // 1. Direct probes to broadcasts and cached IP
             try {
                 discoverySock.send(new DatagramPacket(discoverMsg, discoverMsg.length, InetAddress.getByName("255.255.255.255"), TARGET_PORT));
-                discoverySock.send(new DatagramPacket(discoverMsg, discoverMsg.length, InetAddress.getByName("192.168.0.255"), TARGET_PORT));
+                discoverySock.send(new DatagramPacket(discoverMsg, discoverMsg.length, InetAddress.getByName(subnetPrefix + "255"), TARGET_PORT));
             } catch (Exception ignored) {}
 
             if (lastKnownIp != null && !lastKnownIp.isEmpty()) {
@@ -252,10 +291,18 @@ public class AudioCaptureService extends Service {
                 } catch (Exception ignored) {}
             }
 
+            // 2. Fast single-socket sweep across all 254 local IPs (takes ~15ms total!)
+            for (int i = 1; i <= 254; i++) {
+                try {
+                    discoverySock.send(new DatagramPacket(discoverMsg, discoverMsg.length, InetAddress.getByName(subnetPrefix + i), TARGET_PORT));
+                } catch (Exception ignored) {}
+            }
+
+            // 3. Listen for response
             byte[] recvBuf = new byte[64];
             DatagramPacket recvPacket = new DatagramPacket(recvBuf, recvBuf.length);
 
-            long deadline = System.currentTimeMillis() + 600;
+            long deadline = System.currentTimeMillis() + 800;
             while (System.currentTimeMillis() < deadline) {
                 try {
                     discoverySock.receive(recvPacket);
@@ -267,44 +314,12 @@ public class AudioCaptureService extends Service {
                         Log.i(TAG, "REAPER WOB discovered at: " + foundIp);
                         return foundIp;
                     }
-                } catch (Exception e) {
+                } catch (Exception ignored) {
                     break;
                 }
             }
 
-            final AtomicBoolean found = new AtomicBoolean(false);
-            final String[] resultIp = new String[]{lastKnownIp};
-            ExecutorService pool = Executors.newFixedThreadPool(16);
-
-            for (int i = 1; i <= 254; i++) {
-                final String probeIp = "192.168.0." + i;
-                pool.execute(() -> {
-                    if (found.get()) return;
-                    try {
-                        DatagramSocket s = new DatagramSocket();
-                        s.setSoTimeout(250);
-                        s.send(new DatagramPacket(discoverMsg, discoverMsg.length, InetAddress.getByName(probeIp), TARGET_PORT));
-                        byte[] b = new byte[32];
-                        DatagramPacket p = new DatagramPacket(b, b.length);
-                        s.receive(p);
-                        String str = new String(p.getData(), 0, p.getLength());
-                        if (str.contains("NA_OFFER")) {
-                            found.set(true);
-                            resultIp[0] = probeIp;
-                        }
-                        s.close();
-                    } catch (Exception ignored) {}
-                });
-            }
-            pool.shutdown();
-            try { Thread.sleep(250); } catch (InterruptedException ignored) {}
-
             discoverySock.close();
-            if (found.get()) {
-                prefs.edit().putString(KEY_LAST_IP, resultIp[0]).apply();
-                return resultIp[0];
-            }
-
         } catch (Exception e) {
             Log.e(TAG, "Discovery error: " + e.getMessage());
         }
@@ -411,7 +426,7 @@ public class AudioCaptureService extends Service {
         }
 
         if (mediaProjection != null) {
-            mediaProjection.stop();
+            try { mediaProjection.stop(); } catch (Exception ignored) {}
             mediaProjection = null;
         }
 
@@ -423,6 +438,11 @@ public class AudioCaptureService extends Service {
         if (wifiLock != null && wifiLock.isHeld()) {
             try { wifiLock.release(); } catch (Exception ignored) {}
             wifiLock = null;
+        }
+
+        if (multicastLock != null && multicastLock.isHeld()) {
+            try { multicastLock.release(); } catch (Exception ignored) {}
+            multicastLock = null;
         }
 
         if (originalMediaVolume >= 0 && audioManager != null) {
