@@ -58,7 +58,7 @@ struct AEffect {
 #define DEFAULT_PORT 58200
 #define PACKET_MAGIC 0x4E41 // 'NA'
 #define INPUT_SAMPLE_RATE 48000.0
-#define RING_BUFFER_SIZE 65536 // Power of 2 per client (~1.36s)
+#define RING_BUFFER_SIZE 65536 // Power of 2 per client (~1.36s at 48k)
 #define RING_BUFFER_MASK (RING_BUFFER_SIZE - 1)
 #define MAX_CLIENTS 4
 
@@ -82,6 +82,15 @@ typedef struct {
     bool prebuffering;
     float fadeVolume;
 
+    // Adaptive buffer & network monitoring
+    float targetBufferMs;       // Dynamic cushion (50ms - 220ms)
+    float currentJitterMs;      // Moving average of packet arrival jitter
+    DWORD lastPacketArrivalTick;// High resolution arrival time tracking
+    DWORD lastJitterSpikeTick;  // Last time jitter increased
+    uint32_t ackCounter;        // Counter for periodic ACKs to phone
+    uint16_t lastSeq;           // Last packet sequence received
+    uint32_t packetsReceived;   // Total packets received
+
     StereoSample ringBuffer[RING_BUFFER_SIZE];
     volatile uint32_t writeIndex;
     double readPos;
@@ -97,7 +106,6 @@ typedef struct {
 
     float hostSampleRate;
     float masterGain;
-    float targetBufferMs; // Ultra-Low Latency: 25 ms (~1200 frames)
 
     float meterPeakL;
     float meterPeakR;
@@ -124,12 +132,13 @@ static ClientStream* getClientStream(PluginState* state, struct sockaddr_in* add
     for (int i = 0; i < MAX_CLIENTS; ++i) {
         if (state->clients[i].active && state->clients[i].clientIP == ip) {
             state->clients[i].lastSeenTick = now;
+            state->clients[i].clientPort = ntohs(addr->sin_port);
             return &state->clients[i];
         }
     }
 
     for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (!state->clients[i].active || (now - state->clients[i].lastSeenTick) > 2000) {
+        if (!state->clients[i].active || (now - state->clients[i].lastSeenTick) > 3000) {
             ClientStream* c = &state->clients[i];
             c->clientIP = ip;
             c->clientPort = ntohs(addr->sin_port);
@@ -140,6 +149,13 @@ static ClientStream* getClientStream(PluginState* state, struct sockaddr_in* add
             c->prebuffering = true;
             c->fadeVolume = 0.0f;
             c->active = true;
+            c->targetBufferMs = 80.0f; // Start with healthy safe cushion
+            c->currentJitterMs = 0.0f;
+            c->lastPacketArrivalTick = 0;
+            c->lastJitterSpikeTick = now;
+            c->ackCounter = 0;
+            c->lastSeq = 0;
+            c->packetsReceived = 0;
             return c;
         }
     }
@@ -148,7 +164,7 @@ static ClientStream* getClientStream(PluginState* state, struct sockaddr_in* add
 
 static DWORD WINAPI udpReceiverThread(LPVOID param) {
     PluginState* state = (PluginState*)param;
-    char buffer[1500];
+    char buffer[2048];
     struct sockaddr_in clientAddr;
 
     while (state->running) {
@@ -156,9 +172,11 @@ static DWORD WINAPI udpReceiverThread(LPVOID param) {
         int bytes = recvfrom(state->sock, buffer, sizeof(buffer), 0, (struct sockaddr*)&clientAddr, &clientLen);
         if (bytes <= 0) continue;
 
-        // Auto-Discovery: Phone broadcasts "NA_DISCOVER"
+        DWORD now = GetTickCount();
+
+        // 1. Auto-Discovery & Handshake: Phone broadcasts "NA_DISCOVER"
         if (bytes >= 11 && memcmp(buffer, "NA_DISCOVER", 11) == 0) {
-            const char* reply = "NA_OFFER";
+            const char* reply = "NA_OFFER:WOB4";
             sendto(state->sock, reply, (int)strlen(reply), 0, (struct sockaddr*)&clientAddr, clientLen);
             continue;
         }
@@ -168,13 +186,40 @@ static DWORD WINAPI udpReceiverThread(LPVOID param) {
         if (packet->magic != PACKET_MAGIC && (bytes % 4 != 0)) continue;
 
         ClientStream* client = getClientStream(state, &clientAddr);
-        if (bytes == 4) continue; // Keep-alive
+        if (bytes == 4) {
+            // Keep-alive ping from phone: reply with immediate ACK
+            char ackPing[64];
+            snprintf(ackPing, sizeof(ackPing), "NA_ACK:%u:%.0f", (unsigned int)client->packetsReceived, client->targetBufferMs);
+            sendto(state->sock, ackPing, (int)strlen(ackPing), 0, (struct sockaddr*)&clientAddr, clientLen);
+            continue;
+        }
 
         int16_t* pcmData;
         int numSamples;
         if (packet->magic == PACKET_MAGIC) {
             pcmData = packet->pcm;
             numSamples = (bytes - 4) / sizeof(int16_t);
+
+            // Jitter Tracking & Autonomous Buffer Adaptation
+            if (client->lastPacketArrivalTick > 0) {
+                DWORD delta = now - client->lastPacketArrivalTick;
+                // Expected arrival interval is ~5ms
+                float instantJitter = fabsf((float)delta - 5.0f);
+                client->currentJitterMs = client->currentJitterMs * 0.92f + instantJitter * 0.08f;
+
+                // Check for packet loss or severe arrival jitter (>15ms)
+                bool seqJump = (client->lastSeq != 0 && (uint16_t)(packet->seq - client->lastSeq) > 1);
+                if (instantJitter > 14.0f || seqJump) {
+                    // Wi-Fi is fluctuating: expand buffer cushion automatically!
+                    if (client->targetBufferMs < 220.0f) {
+                        client->targetBufferMs += 20.0f;
+                        if (client->targetBufferMs > 220.0f) client->targetBufferMs = 220.0f;
+                        client->lastJitterSpikeTick = now;
+                    }
+                }
+            }
+            client->lastPacketArrivalTick = now;
+            client->lastSeq = packet->seq;
         } else {
             pcmData = (int16_t*)buffer;
             numSamples = bytes / sizeof(int16_t);
@@ -182,6 +227,8 @@ static DWORD WINAPI udpReceiverThread(LPVOID param) {
 
         int numStereoFrames = numSamples / 2;
         if (numStereoFrames <= 0) continue;
+
+        client->packetsReceived++;
 
         uint32_t w = client->writeIndex;
         for (int i = 0; i < numStereoFrames; ++i) {
@@ -191,6 +238,13 @@ static DWORD WINAPI udpReceiverThread(LPVOID param) {
         }
         MemoryBarrier();
         client->writeIndex = w;
+
+        // Periodic ACK (every 40 packets = ~200ms) to confirm live stream to the phone
+        if ((++client->ackCounter % 40) == 0) {
+            char ackMsg[64];
+            snprintf(ackMsg, sizeof(ackMsg), "NA_ACK:%u:%.0f", (unsigned int)client->packetsReceived, client->targetBufferMs);
+            sendto(state->sock, ackMsg, (int)strlen(ackMsg), 0, (struct sockaddr*)&clientAddr, clientLen);
+        }
     }
     return 0;
 }
@@ -202,10 +256,10 @@ static void startNetworking(PluginState* state) {
     state->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (state->sock == INVALID_SOCKET) return;
 
-    int rcvBuf = 512 * 1024;
+    int rcvBuf = 1024 * 1024; // 1 MB receive buffer to absorb any Wi-Fi bursts
     setsockopt(state->sock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvBuf, sizeof(rcvBuf));
 
-    DWORD timeout = 200;
+    DWORD timeout = 250;
     setsockopt(state->sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 
     int broadcast = 1;
@@ -253,7 +307,6 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
 
     DWORD now = GetTickCount();
     float hostRate = state->hostSampleRate > 1000.0f ? state->hostSampleRate : 44100.0f;
-    uint32_t targetFrames = (uint32_t)(INPUT_SAMPLE_RATE * (state->targetBufferMs / 1000.0f)); // ~1200 frames (25ms)
 
     for (int i = 0; i < frames; ++i) {
         outL[i] = 0.0f;
@@ -268,7 +321,8 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
         ClientStream* client = &state->clients[c];
         if (!client->active) continue;
 
-        if ((now - client->lastSeenTick) > 500) {
+        // Disconnect if no packet received for > 2.5 seconds
+        if ((now - client->lastSeenTick) > 2500) {
             client->active = false;
             client->fadeVolume = 0.0f;
             continue;
@@ -276,11 +330,20 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
 
         activeCount++;
 
+        // Autonomous buffer relaxation: if network has been clean and quiet for > 8s, gently reduce cushion
+        if ((now - client->lastJitterSpikeTick) > 8000 && client->targetBufferMs > 60.0f) {
+            client->targetBufferMs -= 0.015f;
+            if (client->targetBufferMs < 60.0f) client->targetBufferMs = 60.0f;
+        }
+
+        uint32_t targetFrames = (uint32_t)(INPUT_SAMPLE_RATE * (client->targetBufferMs / 1000.0f));
+        if (targetFrames < 1920) targetFrames = 1920; // Absolute minimum 40ms floor
+
         uint32_t w = client->writeIndex;
         uint32_t rInt = (uint32_t)client->readPos;
         uint32_t available = (w - rInt) & RING_BUFFER_MASK;
 
-        // Pre-buffering: wait until 25ms cushion is ready
+        // Pre-buffering: wait until dynamic target cushion is filled
         if (client->prebuffering) {
             if (available >= targetFrames) {
                 client->prebuffering = false;
@@ -290,11 +353,11 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
             }
         }
 
-        // Continuous proportional clock drift steering (locks buffer around target cushion)
+        // Proportional clock drift steering (smooth, inaudible resampling ratio adjustment)
         double diff = (double)available - (double)targetFrames;
-        double driftFactor = 1.0 + (diff / (double)targetFrames) * 0.005;
-        if (driftFactor > 1.01) driftFactor = 1.01;
-        if (driftFactor < 0.99) driftFactor = 0.99;
+        double driftFactor = 1.0 + (diff / (double)targetFrames) * 0.004;
+        if (driftFactor > 1.008) driftFactor = 1.008;
+        if (driftFactor < 0.992) driftFactor = 0.992;
 
         double step = (INPUT_SAMPLE_RATE / (double)hostRate) * driftFactor;
 
@@ -304,7 +367,7 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
 
             if (curAvail >= 2) {
                 if (client->fadeVolume < 1.0f) {
-                    client->fadeVolume += (1.0f / 64.0f);
+                    client->fadeVolume += (1.0f / 128.0f);
                     if (client->fadeVolume > 1.0f) client->fadeVolume = 1.0f;
                 }
 
@@ -326,13 +389,21 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
                     client->readPos -= (double)RING_BUFFER_SIZE;
                 }
             } else {
-                // Buffer momentarily starved: gently decay volume without hard cutting to silence
-                if (client->fadeVolume > 0.0f) {
-                    client->fadeVolume -= (1.0f / 128.0f);
-                    if (client->fadeVolume < 0.0f) client->fadeVolume = 0.0f;
+                // Buffer momentary starvation (severe Wi-Fi delay):
+                // Expand cushion immediately so this doesn't happen again!
+                if (client->targetBufferMs < 220.0f) {
+                    client->targetBufferMs = 220.0f;
+                    client->lastJitterSpikeTick = now;
                 }
-                // Only enter hard prebuffering if starved for > 150ms
-                if ((now - client->lastSeenTick) > 150) {
+
+                // Smooth decay without hard silence clicks
+                if (client->fadeVolume > 0.0f) {
+                    client->fadeVolume *= 0.995f;
+                    if (client->fadeVolume < 0.001f) client->fadeVolume = 0.0f;
+                }
+
+                // If starved for more than 400ms, enter clean pre-buffering
+                if ((now - client->lastSeenTick) > 400) {
                     client->prebuffering = true;
                 }
             }
@@ -377,12 +448,12 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             HBITMAP memBM = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
             HBITMAP oldBM = (HBITMAP)SelectObject(memDC, memBM);
 
-            HBRUSH bgBrush = CreateSolidBrush(RGB(20, 22, 25));
+            HBRUSH bgBrush = CreateSolidBrush(RGB(18, 20, 24));
             FillRect(memDC, &rc, bgBrush);
             DeleteObject(bgBrush);
 
             RECT headerRc = { 0, 0, rc.right, 38 };
-            HBRUSH headerBrush = CreateSolidBrush(RGB(15, 16, 18));
+            HBRUSH headerBrush = CreateSolidBrush(RGB(14, 15, 18));
             FillRect(memDC, &headerRc, headerBrush);
             DeleteObject(headerBrush);
 
@@ -393,30 +464,41 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                                           CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
             HFONT oldFont = (HFONT)SelectObject(memDC, hFontTitle);
             SetTextColor(memDC, RGB(0, 220, 200));
-            TextOutA(memDC, 16, 8, "WOB 3.0", 7);
+            TextOutA(memDC, 16, 8, "WOB 4.0", 7);
 
             HFONT hFontSmall = CreateFontA(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                            CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
             SelectObject(memDC, hFontSmall);
             SetTextColor(memDC, RGB(130, 130, 140));
-            TextOutA(memDC, 65, 12, "(Without Bluetooth)  v3.0 - Ultra-Low Latency", 45);
+            TextOutA(memDC, 65, 12, "(Without Bluetooth)  Auto-Adaptativo Blindado", 45);
 
             int count = state->activeClientCount;
             HBRUSH dotBrush;
             char statusText[128];
+            char infoText[128];
+
             if (count > 0) {
                 dotBrush = CreateSolidBrush(RGB(46, 213, 115));
-                if (count == 1) {
-                    sprintf(statusText, "CONECTADO: 1 telÃ©fono activo (En vivo)");
+                ClientStream* first = NULL;
+                for (int c = 0; c < MAX_CLIENTS; ++c) {
+                    if (state->clients[c].active) { first = &state->clients[c]; break; }
+                }
+
+                if (first) {
+                    sprintf(statusText, "CONECTADO A: %s (En vivo)", first->ipStr);
+                    sprintf(infoText, "BÃºfer Inteligente: %.0f ms  |  Jitter Wi-Fi: %.1f ms  |  Paquetes: %u",
+                            first->targetBufferMs, first->currentJitterMs, (unsigned int)first->packetsReceived);
                 } else {
-                    sprintf(statusText, "CONECTADO: %d telÃ©fonos activos (Colaborativo)", count);
+                    sprintf(statusText, "CONECTADO (En vivo)");
+                    sprintf(infoText, "BÃºfer DinÃ¡mico Auto-Adaptativo Activo");
                 }
                 SetTextColor(memDC, RGB(46, 213, 115));
             } else {
                 dotBrush = CreateSolidBrush(RGB(255, 160, 40));
                 strcpy(statusText, "ESPERANDO CONEXION DESDE LA APP WOB...");
-                SetTextColor(memDC, RGB(220, 170, 100));
+                strcpy(infoText, "Abre la app WOB en tu celular y pulsa CONECTAR.");
+                SetTextColor(memDC, RGB(240, 180, 80));
             }
 
             HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, dotBrush);
@@ -433,20 +515,20 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             TextOutA(memDC, 42, 51, statusText, (int)strlen(statusText));
 
             RECT boxRc = { 16, 76, rc.right - 16, 128 };
-            HBRUSH boxBrush = CreateSolidBrush(RGB(28, 30, 35));
+            HBRUSH boxBrush = CreateSolidBrush(RGB(26, 28, 33));
             FillRect(memDC, &boxRc, boxBrush);
             DeleteObject(boxBrush);
 
             SelectObject(memDC, hFontSmall);
             SetTextColor(memDC, RGB(180, 180, 190));
-            TextOutA(memDC, 28, 84, "CONEXION AUTOMATICA INTELIGENTE:", 32);
+            TextOutA(memDC, 28, 84, "ESTADO DEL ENLACE WI-FI:", 24);
 
             HFONT hFontSub = CreateFontA(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                         CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
             SelectObject(memDC, hFontSub);
-            SetTextColor(memDC, RGB(120, 200, 180));
-            TextOutA(memDC, 28, 103, "Cero configuracion. Solo toca el boton en tu telefono.", 54);
+            SetTextColor(memDC, RGB(120, 210, 190));
+            TextOutA(memDC, 28, 103, infoText, (int)strlen(infoText));
 
             SelectObject(memDC, hFontSmall);
             SetTextColor(memDC, RGB(130, 130, 140));
@@ -459,7 +541,7 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (barL > meterWidth) barL = meterWidth;
             if (barR > meterWidth) barR = meterWidth;
 
-            HBRUSH mBg = CreateSolidBrush(RGB(35, 38, 44));
+            HBRUSH mBg = CreateSolidBrush(RGB(32, 35, 42));
             RECT mBgL = { 42, 144, 42 + meterWidth, 154 };
             RECT mBgR = { 42, 164, 42 + meterWidth, 174 };
             FillRect(memDC, &mBgL, mBg);
@@ -553,10 +635,10 @@ static intptr_t dispatcher(struct AEffect* e, int32_t op, int32_t idx, intptr_t 
                 state->hwndEditor = NULL;
             }
             return 0;
-        case 45: if (ptr) { lstrcpyA((char*)ptr, "WOB 3.0"); return 1; } break;
+        case 45: if (ptr) { lstrcpyA((char*)ptr, "WOB 4.0"); return 1; } break;
         case 47: if (ptr) { lstrcpyA((char*)ptr, "WOB Audio"); return 1; } break;
-        case 48: if (ptr) { lstrcpyA((char*)ptr, "WOB 3.0"); return 1; } break;
-        case 49: return 3000;
+        case 48: if (ptr) { lstrcpyA((char*)ptr, "WOB 4.0"); return 1; } break;
+        case 49: return 4000;
         case 58: return 2400;
     }
     return 0;
@@ -578,7 +660,6 @@ __declspec(dllexport) struct AEffect* VSTPluginMain(audioMasterCallback audioMas
     memset(&g_state, 0, sizeof(g_state));
     g_state.hostSampleRate = 44100.0f;
     g_state.masterGain = 1.0f;
-    g_state.targetBufferMs = 35.0f; // Ultra-Low Latency (~25ms, almost instant!)
 
     memset(&g_effect, 0, sizeof(g_effect));
     g_effect.magic = kEffectMagic;
@@ -591,7 +672,7 @@ __declspec(dllexport) struct AEffect* VSTPluginMain(audioMasterCallback audioMas
     g_effect.numInputs = 0;
     g_effect.numOutputs = 2;
     g_effect.uniqueID = 0x574F4250; // 'WOBP'
-    g_effect.version = 3000;
+    g_effect.version = 4000;
     g_effect.flags = (1 << 4) | (1 << 0);
     g_effect.object = &g_state;
 

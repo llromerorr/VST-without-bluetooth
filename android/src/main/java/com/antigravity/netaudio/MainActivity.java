@@ -16,7 +16,7 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements AudioCaptureService.ConnectionListener {
     private static final int REQUEST_MEDIA_PROJECTION = 1001;
     private static final int REQUEST_AUDIO_PERMISSION = 2001;
 
@@ -62,8 +62,6 @@ public class MainActivity extends Activity {
             public void onStopTrackingTouch(SeekBar seekBar) {}
         });
 
-        updateUiState();
-
         btnPower.setOnClickListener(v -> {
             if (AudioCaptureService.isRunning) {
                 stopStreaming();
@@ -87,7 +85,7 @@ public class MainActivity extends Activity {
             }
         }
 
-        // Prompt to ignore battery optimization so Android never sleeps the app
+        // Prompt to ignore battery optimization so Android never sleeps the Wi-Fi
         requestBatteryOptimizationExemption();
     }
 
@@ -107,24 +105,57 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        AudioCaptureService.setListener(this);
         seekVolume.setProgress(AudioCaptureService.currentVolumePercent);
         txtVolume.setText("VOLUMEN: " + AudioCaptureService.currentVolumePercent + "%");
-        updateUiState();
+        updateUiState(AudioCaptureService.connectionState, AudioCaptureService.connectionInfo);
     }
 
-    private void updateUiState() {
-        if (AudioCaptureService.isRunning) {
-            btnPower.setText("TRANSMITIENDO\n\n(TOCA PARA APAGAR)");
-            btnPower.setBackgroundColor(0xFF2ED573);
-            btnPower.setTextColor(0xFF000000);
-            txtStatus.setText("Conectado a REAPER (En vivo)");
-            txtStatus.setTextColor(0xFF2ED573);
-        } else {
-            btnPower.setText("CONECTAR");
-            btnPower.setBackgroundColor(0xFF1E2026);
-            btnPower.setTextColor(0xFF00D2D2);
-            txtStatus.setText("Toca el boton para conectar");
-            txtStatus.setTextColor(0xFFA0A0B0);
+    @Override
+    protected void onPause() {
+        super.onPause();
+        AudioCaptureService.setListener(null);
+    }
+
+    @Override
+    public void onConnectionStateChanged(int state, String message) {
+        runOnUiThread(() -> updateUiState(state, message));
+    }
+
+    private void updateUiState(int state, String message) {
+        switch (state) {
+            case AudioCaptureService.STATE_CONNECTED:
+                btnPower.setText("TRANSMITIENDO\n\n(TOCA PARA APAGAR)");
+                btnPower.setBackgroundColor(0xFF2ED573);
+                btnPower.setTextColor(0xFF000000);
+                txtStatus.setText(message != null ? message : "Conectado a REAPER (En vivo)");
+                txtStatus.setTextColor(0xFF2ED573);
+                break;
+
+            case AudioCaptureService.STATE_SEARCHING:
+                btnPower.setText("BUSCANDO REAPER...\n\n(TOCA PARA CANCELAR)");
+                btnPower.setBackgroundColor(0xFFFFA502);
+                btnPower.setTextColor(0xFF000000);
+                txtStatus.setText(message != null ? message : "Buscando REAPER en tu red local...");
+                txtStatus.setTextColor(0xFFFFA502);
+                break;
+
+            case AudioCaptureService.STATE_RECONNECTING:
+                btnPower.setText("RECONECTANDO...\n\n(TOCA PARA APAGAR)");
+                btnPower.setBackgroundColor(0xFFFF4757);
+                btnPower.setTextColor(0xFFFFFFFF);
+                txtStatus.setText(message != null ? message : "Senal perdida. Reintentando enlace...");
+                txtStatus.setTextColor(0xFFFF4757);
+                break;
+
+            case AudioCaptureService.STATE_IDLE:
+            default:
+                btnPower.setText("CONECTAR");
+                btnPower.setBackgroundColor(0xFF1E2026);
+                btnPower.setTextColor(0xFF00D2D2);
+                txtStatus.setText(message != null ? message : "Toca el boton para conectar");
+                txtStatus.setTextColor(0xFFA0A0B0);
+                break;
         }
     }
 
@@ -139,7 +170,9 @@ public class MainActivity extends Activity {
         intent.setAction(AudioCaptureService.ACTION_STOP);
         startService(intent);
         AudioCaptureService.isRunning = false;
-        updateUiState();
+        AudioCaptureService.connectionState = AudioCaptureService.STATE_IDLE;
+        AudioCaptureService.connectionInfo = "Toca el boton para conectar";
+        updateUiState(AudioCaptureService.STATE_IDLE, AudioCaptureService.connectionInfo);
     }
 
     @Override
@@ -158,7 +191,7 @@ public class MainActivity extends Activity {
                 }
 
                 AudioCaptureService.isRunning = true;
-                updateUiState();
+                updateUiState(AudioCaptureService.STATE_SEARCHING, "Buscando REAPER en tu red local...");
             } else {
                 Toast.makeText(this, "Permiso de captura denegado", Toast.LENGTH_SHORT).show();
             }

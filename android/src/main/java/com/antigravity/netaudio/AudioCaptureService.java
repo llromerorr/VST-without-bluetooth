@@ -30,6 +30,7 @@ import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Enumeration;
@@ -51,14 +52,50 @@ public class AudioCaptureService extends Service {
     public static final String EXTRA_RESULT_DATA = "EXTRA_RESULT_DATA";
     public static final String EXTRA_VOLUME = "EXTRA_VOLUME";
 
-    public static boolean isRunning = false;
+    // Connection States
+    public static final int STATE_IDLE = 0;
+    public static final int STATE_SEARCHING = 1;
+    public static final int STATE_CONNECTED = 2;
+    public static final int STATE_RECONNECTING = 3;
+
+    public interface ConnectionListener {
+        void onConnectionStateChanged(int state, String message);
+    }
+
+    public static volatile boolean isRunning = false;
+    public static volatile int connectionState = STATE_IDLE;
+    public static volatile String connectionInfo = "Toca el boton para conectar";
     public static volatile int currentVolumePercent = 100; // 0..100%
+
+    private static ConnectionListener activeListener = null;
+
+    public static synchronized void setListener(ConnectionListener listener) {
+        activeListener = listener;
+        if (listener != null) {
+            listener.onConnectionStateChanged(connectionState, connectionInfo);
+        }
+    }
+
+    private void updateState(int state, String info) {
+        connectionState = state;
+        connectionInfo = info;
+        updateNotification();
+        ConnectionListener l = activeListener;
+        if (l != null) {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                ConnectionListener cur = activeListener;
+                if (cur != null) cur.onConnectionStateChanged(state, info);
+            });
+        }
+    }
 
     private MediaProjection mediaProjection;
     private AudioRecord audioRecord;
     private DatagramSocket udpSocket;
     private Thread workerThread;
+    private Thread ackThread;
     private volatile boolean isCapturing = false;
+    private volatile long lastAckTime = 0;
 
     private AudioManager audioManager;
     private int originalMediaVolume = -1;
@@ -100,19 +137,19 @@ public class AudioCaptureService extends Service {
         }
 
         if (ACTION_VOL_UP.equals(action)) {
-            currentVolumePercent = Math.min(100, currentVolumePercent + 10);
+            currentVolumePercent = Math.min(100, currentVolumePercent + 5);
             updateNotification();
             return START_NOT_STICKY;
         }
 
         if (ACTION_VOL_DOWN.equals(action)) {
-            currentVolumePercent = Math.max(0, currentVolumePercent - 10);
+            currentVolumePercent = Math.max(0, currentVolumePercent - 5);
             updateNotification();
             return START_NOT_STICKY;
         }
 
         if (ACTION_SET_VOL.equals(action)) {
-            currentVolumePercent = Math.max(0, Math.min(100, intent.getIntExtra(EXTRA_VOLUME, 100)));
+            currentVolumePercent = intent.getIntExtra(EXTRA_VOLUME, 100);
             updateNotification();
             return START_NOT_STICKY;
         }
@@ -120,7 +157,6 @@ public class AudioCaptureService extends Service {
         if (ACTION_START.equals(action)) {
             int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
             Intent resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA);
-
             startForegroundNotification();
             startStreamingFlow(resultCode, resultData);
         }
@@ -129,25 +165,33 @@ public class AudioCaptureService extends Service {
     }
 
     private Notification buildNotification() {
-        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            flags |= PendingIntent.FLAG_IMMUTABLE;
-        }
+        Intent stopIntent = new Intent(this, AudioCaptureService.class);
+        stopIntent.setAction(ACTION_STOP);
+        int flags = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) ? PendingIntent.FLAG_IMMUTABLE : 0;
+        PendingIntent piStop = PendingIntent.getService(this, 0, stopIntent, flags);
 
-        // Action Volume Down
-        Intent downIntent = new Intent(this, AudioCaptureService.class);
-        downIntent.setAction(ACTION_VOL_DOWN);
-        PendingIntent piDown = PendingIntent.getService(this, 1, downIntent, flags);
+        Intent volUpIntent = new Intent(this, AudioCaptureService.class);
+        volUpIntent.setAction(ACTION_VOL_UP);
+        PendingIntent piUp = PendingIntent.getService(this, 1, volUpIntent, flags);
 
-        // Action Volume Up
-        Intent upIntent = new Intent(this, AudioCaptureService.class);
-        upIntent.setAction(ACTION_VOL_UP);
-        PendingIntent piUp = PendingIntent.getService(this, 2, upIntent, flags);
+        Intent volDownIntent = new Intent(this, AudioCaptureService.class);
+        volDownIntent.setAction(ACTION_VOL_DOWN);
+        PendingIntent piDown = PendingIntent.getService(this, 2, volDownIntent, flags);
 
-        // Intent to open MainActivity
         Intent openIntent = new Intent(this, MainActivity.class);
-        openIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        openIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent piOpen = PendingIntent.getActivity(this, 0, openIntent, flags);
+
+        String title;
+        if (connectionState == STATE_CONNECTED) {
+            title = "WOB: En vivo con REAPER (" + currentVolumePercent + "%)";
+        } else if (connectionState == STATE_SEARCHING) {
+            title = "WOB: Buscando a REAPER...";
+        } else if (connectionState == STATE_RECONNECTING) {
+            title = "WOB: Reconectando senal...";
+        } else {
+            title = "WOB: Inactivo";
+        }
 
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -156,8 +200,8 @@ public class AudioCaptureService extends Service {
             builder = new Notification.Builder(this);
         }
 
-        builder.setContentTitle("WOB: En vivo a REAPER")
-                .setContentText("Volumen: " + currentVolumePercent + "%")
+        builder.setContentTitle(title)
+                .setContentText(connectionInfo)
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .addAction(R.drawable.ic_minus, "-", piDown)
                 .addAction(R.drawable.ic_plus, "+", piUp)
@@ -185,7 +229,7 @@ public class AudioCaptureService extends Service {
     }
 
     private void updateNotification() {
-        if (notificationManager != null && isCapturing) {
+        if (notificationManager != null && isRunning) {
             notificationManager.notify(NOTIF_ID, buildNotification());
         }
     }
@@ -205,7 +249,6 @@ public class AudioCaptureService extends Service {
             return;
         }
 
-        // Android 14+ requires a Callback registered on mediaProjection before use
         try {
             mediaProjection.registerCallback(new MediaProjection.Callback() {
                 @Override
@@ -231,7 +274,6 @@ public class AudioCaptureService extends Service {
                 wifiLock = wm.createWifiLock(wifiMode, "WOB:WifiLock");
                 wifiLock.acquire();
 
-                // MulticastLock allows UDP broadcasts to pass through on MediaTek/Tecno/Xiaomi chips
                 multicastLock = wm.createMulticastLock("WOB:MulticastLock");
                 multicastLock.setReferenceCounted(false);
                 multicastLock.acquire();
@@ -244,7 +286,8 @@ public class AudioCaptureService extends Service {
         }
 
         isCapturing = true;
-        workerThread = new Thread(() -> runStreaming());
+        updateState(STATE_SEARCHING, "Buscando REAPER en tu red local...");
+        workerThread = new Thread(this::runStreaming);
         workerThread.start();
     }
 
@@ -269,13 +312,13 @@ public class AudioCaptureService extends Service {
 
     private String discoverTargetPC() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String lastKnownIp = prefs.getString(KEY_LAST_IP, "192.168.0.116");
+        String lastKnownIp = prefs.getString(KEY_LAST_IP, "");
         String subnetPrefix = getLocalSubnetPrefix();
 
         try {
             DatagramSocket discoverySock = new DatagramSocket();
             discoverySock.setBroadcast(true);
-            discoverySock.setSoTimeout(500);
+            discoverySock.setSoTimeout(300);
 
             byte[] discoverMsg = "NA_DISCOVER".getBytes();
 
@@ -291,7 +334,7 @@ public class AudioCaptureService extends Service {
                 } catch (Exception ignored) {}
             }
 
-            // 2. Fast single-socket sweep across all 254 local IPs (takes ~15ms total!)
+            // 2. Fast single-socket sweep across all 254 local IPs (~15ms total)
             for (int i = 1; i <= 254; i++) {
                 try {
                     discoverySock.send(new DatagramPacket(discoverMsg, discoverMsg.length, InetAddress.getByName(subnetPrefix + i), TARGET_PORT));
@@ -299,10 +342,10 @@ public class AudioCaptureService extends Service {
             }
 
             // 3. Listen for response
-            byte[] recvBuf = new byte[64];
+            byte[] recvBuf = new byte[128];
             DatagramPacket recvPacket = new DatagramPacket(recvBuf, recvBuf.length);
 
-            long deadline = System.currentTimeMillis() + 800;
+            long deadline = System.currentTimeMillis() + 900;
             while (System.currentTimeMillis() < deadline) {
                 try {
                     discoverySock.receive(recvPacket);
@@ -311,9 +354,11 @@ public class AudioCaptureService extends Service {
                         String foundIp = recvPacket.getAddress().getHostAddress();
                         prefs.edit().putString(KEY_LAST_IP, foundIp).apply();
                         discoverySock.close();
-                        Log.i(TAG, "REAPER WOB discovered at: " + foundIp);
+                        Log.i(TAG, "REAPER WOB confirmed at: " + foundIp);
                         return foundIp;
                     }
+                } catch (SocketTimeoutException ignored) {
+                    break;
                 } catch (Exception ignored) {
                     break;
                 }
@@ -324,14 +369,35 @@ public class AudioCaptureService extends Service {
             Log.e(TAG, "Discovery error: " + e.getMessage());
         }
 
-        return lastKnownIp;
+        return null;
     }
 
     private void runStreaming() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
 
-        String targetIp = discoverTargetPC();
-        Log.i(TAG, "Streaming to target: " + targetIp);
+        String targetIp = null;
+
+        // Discovery loop: will keep searching until REAPER responds (NO fake connections!)
+        while (isCapturing && targetIp == null) {
+            updateState(STATE_SEARCHING, "Buscando REAPER en tu red Wi-Fi...");
+            targetIp = discoverTargetPC();
+
+            if (targetIp == null) {
+                // If not found, try last known IP once with a direct probe
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                String lastKnown = prefs.getString(KEY_LAST_IP, "");
+                if (lastKnown != null && !lastKnown.isEmpty()) {
+                    targetIp = lastKnown;
+                    Log.i(TAG, "Probing last known IP: " + targetIp);
+                    break;
+                }
+
+                updateState(STATE_SEARCHING, "REAPER no detectado. Abre REAPER con WOB en la PC.");
+                try { Thread.sleep(1500); } catch (InterruptedException e) { return; }
+            }
+        }
+
+        if (!isCapturing || targetIp == null) return;
 
         final int sampleRate = 48000;
         final int channelConfig = AudioFormat.CHANNEL_IN_STEREO;
@@ -360,25 +426,76 @@ public class AudioCaptureService extends Service {
             }
 
             udpSocket = new DatagramSocket();
-            udpSocket.setSendBufferSize(256 * 1024);
+            udpSocket.setSendBufferSize(512 * 1024);
+            udpSocket.setSoTimeout(300); // non-blocking for ACK reception
             InetAddress targetAddr = InetAddress.getByName(targetIp);
 
+            // Send initial connection handshake ping
             byte[] initPing = new byte[]{0x4E, 0x41, 0, 0};
             udpSocket.send(new DatagramPacket(initPing, initPing.length, targetAddr, TARGET_PORT));
+            lastAckTime = System.currentTimeMillis();
 
-            final int samplesPerPacket = 480; // 5ms
+            // Background ACK listener thread: validates live two-way communication
+            final String fTargetIp = targetIp;
+            ackThread = new Thread(() -> {
+                byte[] ackBuf = new byte[128];
+                DatagramPacket ackPacket = new DatagramPacket(ackBuf, ackBuf.length);
+                while (isCapturing && udpSocket != null && !udpSocket.isClosed()) {
+                    try {
+                        udpSocket.receive(ackPacket);
+                        String msg = new String(ackPacket.getData(), 0, ackPacket.getLength());
+                        if (msg.startsWith("NA_ACK") || msg.startsWith("NA_OFFER")) {
+                            lastAckTime = System.currentTimeMillis();
+                            if (connectionState != STATE_CONNECTED) {
+                                updateState(STATE_CONNECTED, "Conectado a REAPER (" + fTargetIp + ") - En vivo");
+                            }
+                        }
+                    } catch (SocketTimeoutException ignored) {
+                    } catch (Exception ignored) {
+                        break;
+                    }
+                }
+            });
+            ackThread.setDaemon(true);
+            ackThread.start();
+
+            // 5ms packets = 240 stereo frames = 480 shorts (964 bytes payload, always under 1500 MTU)
+            final int samplesPerPacket = 480;
             short[] audioBuffer = new short[samplesPerPacket];
-            byte[] packetBytes = new byte[4 + samplesPerPacket * 2]; // 964 bytes
+            byte[] packetBytes = new byte[4 + samplesPerPacket * 2];
             ByteBuffer bb = ByteBuffer.wrap(packetBytes).order(ByteOrder.LITTLE_ENDIAN);
             short seq = 1;
 
             audioRecord.startRecording();
-            Log.i(TAG, "Audio recording started");
+            updateState(STATE_CONNECTED, "Conectado a REAPER (" + targetIp + ") - En vivo");
+            Log.i(TAG, "Audio recording started, streaming to " + targetIp);
 
             long lastSendTime = System.currentTimeMillis();
+            long lastDiscoveryRetryTime = 0;
 
             while (isCapturing) {
                 int read = audioRecord.read(audioBuffer, 0, samplesPerPacket, AudioRecord.READ_BLOCKING);
+                long now = System.currentTimeMillis();
+
+                // Heartbeat & Connection Health Check:
+                if (now - lastAckTime > 3000) {
+                    // No ACK received in 3 seconds: connection is struggling or lost!
+                    if (connectionState == STATE_CONNECTED) {
+                        updateState(STATE_RECONNECTING, "Senal debil o perdida. Reconectando...");
+                    }
+
+                    // Periodic background rediscovery pulse every 2s
+                    if (now - lastDiscoveryRetryTime > 2000) {
+                        lastDiscoveryRetryTime = now;
+                        new Thread(() -> {
+                            String newIp = discoverTargetPC();
+                            if (newIp != null && !newIp.equals(fTargetIp)) {
+                                Log.i(TAG, "REAPER moved to new IP: " + newIp);
+                            }
+                        }).start();
+                    }
+                }
+
                 if (read > 0) {
                     float gain = (float) currentVolumePercent / 100.0f;
 
@@ -391,13 +508,18 @@ public class AudioCaptureService extends Service {
                     }
 
                     DatagramPacket packet = new DatagramPacket(packetBytes, 4 + read * 2, targetAddr, TARGET_PORT);
-                    udpSocket.send(packet);
-                    lastSendTime = System.currentTimeMillis();
-                } else {
-                    long now = System.currentTimeMillis();
-                    if (now - lastSendTime > 150) {
-                        udpSocket.send(new DatagramPacket(initPing, initPing.length, targetAddr, TARGET_PORT));
+                    try {
+                        udpSocket.send(packet);
                         lastSendTime = now;
+                    } catch (Exception e) {
+                        // Wi-Fi socket send failed (e.g. temporary network interface transition)
+                    }
+                } else {
+                    if (now - lastSendTime > 150) {
+                        try {
+                            udpSocket.send(new DatagramPacket(initPing, initPing.length, targetAddr, TARGET_PORT));
+                            lastSendTime = now;
+                        } catch (Exception ignored) {}
                     }
                 }
             }
@@ -407,6 +529,13 @@ public class AudioCaptureService extends Service {
         } finally {
             cleanup();
         }
+    }
+
+    private void stopCapturing() {
+        isCapturing = false;
+        isRunning = false;
+        updateState(STATE_IDLE, "Toca el boton para conectar");
+        cleanup();
     }
 
     private void cleanup() {
@@ -421,8 +550,13 @@ public class AudioCaptureService extends Service {
         }
 
         if (udpSocket != null && !udpSocket.isClosed()) {
-            udpSocket.close();
+            try { udpSocket.close(); } catch (Exception ignored) {}
             udpSocket = null;
+        }
+
+        if (ackThread != null) {
+            try { ackThread.interrupt(); } catch (Exception ignored) {}
+            ackThread = null;
         }
 
         if (mediaProjection != null) {
@@ -446,19 +580,11 @@ public class AudioCaptureService extends Service {
         }
 
         if (originalMediaVolume >= 0 && audioManager != null) {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, originalMediaVolume, 0);
+            try { audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, originalMediaVolume, 0); } catch (Exception ignored) {}
             originalMediaVolume = -1;
         }
-    }
 
-    private void stopCapturing() {
-        isCapturing = false;
-        if (workerThread != null) {
-            workerThread.interrupt();
-            workerThread = null;
-        }
-        cleanup();
-        isRunning = false;
+        updateState(STATE_IDLE, "Toca el boton para conectar");
     }
 
     @Override

@@ -1,25 +1,26 @@
-# WOB 3.0 - VST Plugin (Windows 64-bit)
+# WOB 4.0 - VST Plugin (Windows 64-bit)
 
-Plugin receptor VST2 de audio digital sobre UDP de ultra-baja latencia para DAWs (REAPER, Ableton, FL Studio, etc.), conectado a teléfonos Android mediante la app **WOB 3.0**.
+Plugin receptor VST2 de audio digital sobre UDP de ultra-baja latencia y estabilidad blindada para DAWs (REAPER, Ableton, FL Studio, etc.), conectado a teléfonos Android mediante la app **WOB 4.0**.
 
-## Novedades en la Versión 3.0
-- **Compensación Proporcional de Clock Drift:** Rastreo continuo de la deriva de reloj entre el teléfono y la tarjeta de sonido de la PC. El colchón de audio se mantiene permanentemente estabilizado en ~35 ms sin vaciarse ni desbordarse.
-- **Ocultamiento Suave de Jitter:** Ante micro-retrasos de paquetes Wi-Fi causados por el router, el plugin aplica un desvanecimiento suave en lugar de cortar a silencio forzado.
-- **Autodescubrimiento Instantáneo:** Responde inmediatamente al barrido de subred UDP en el puerto `58200`.
+## Novedades en la Versión 4.0
+- **Búfer Inteligente Auto-Adaptativo:** Ajusta el colchón elástico de forma autónoma entre 60 ms y 220 ms según el *jitter* y las condiciones de la red Wi-Fi. Inmune a cortes al caminar por la casa o en redes 2.4 GHz congestionadas.
+- **Handshake Bidireccional & Heartbeat:** Emite respuestas `NA_OFFER` de descubrimiento y acuses `NA_ACK` periódicos hacia el teléfono para certificar la conexión en vivo.
+- **Ocultamiento Suave de Jitter (PLC):** Desvanecimiento suave en micro-baches para evitar silencios abruptos o clics digitales.
+- **Compensación Proporcional de Clock Drift:** Resampleo continuo inaudible ($\pm 0.4\%$) que fija el búfer permanentemente en el colchón objetivo sin acumulación de latencia ni vaciados.
 - **Suma y Mezcla Multidispositivo:** Permite conectar múltiples teléfonos en simultáneo sumando sus canales con limitador suave anti-clipping.
-- **Interfaz Nativa Win32:** Medidores de pico VU en tiempo real, contador de teléfonos conectados y estado de enlace.
+- **Interfaz Nativa Win32:** Muestra el búfer adaptativo en milisegundos, jitter en vivo, IP del teléfono conectado y medidores de pico VU.
 
 ## Compilación
 Requiere **GCC** (MinGW-w64 o MSYS2):
 ```cmd
 build_vst.bat
 ```
-Generará `bin\WOB-3.0.dll` y `bin\WOB.dll`.
+Generará `bin\WOB-4.0.dll` y `bin\WOB.dll`.
 
 ## Instalación
-1. Copia `WOB-3.0.dll` (o `WOB.dll`) en tu carpeta de VSTs:
+1. Copia `WOB-4.0.dll` (o `WOB.dll`) en tu carpeta de VSTs:
    - `C:\Program Files\VSTPlugins\` o
    - `C:\Program Files\REAPER (x64)\Plugins\FX\`
 2. En REAPER:
    - Ve a `Options` -> `Preferences` -> `VST` -> `Re-scan`.
-   - Inserta `WOB 3.0` en cualquier pista.
+   - Inserta `WOB 4.0` en cualquier pista.
