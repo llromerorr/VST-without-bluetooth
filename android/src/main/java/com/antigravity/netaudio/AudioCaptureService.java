@@ -58,14 +58,17 @@ public class AudioCaptureService extends Service {
     public static final int STATE_CONNECTED = 2;
     public static final int STATE_RECONNECTING = 3;
 
+    public static final int DEFAULT_SAFE_VOLUME = 65; // Safe startup volume (avoids audio shock)
+
     public interface ConnectionListener {
         void onConnectionStateChanged(int state, String message);
+        void onVolumeChanged(int volumePercent);
     }
 
     public static volatile boolean isRunning = false;
     public static volatile int connectionState = STATE_IDLE;
     public static volatile String connectionInfo = "Toca el boton para conectar";
-    public static volatile int currentVolumePercent = 100; // 0..100%
+    public static volatile int currentVolumePercent = DEFAULT_SAFE_VOLUME; // Starts safely at 65%
 
     private static ConnectionListener activeListener = null;
 
@@ -73,6 +76,17 @@ public class AudioCaptureService extends Service {
         activeListener = listener;
         if (listener != null) {
             listener.onConnectionStateChanged(connectionState, connectionInfo);
+            listener.onVolumeChanged(currentVolumePercent);
+        }
+    }
+
+    private static void notifyVolumeChanged() {
+        ConnectionListener l = activeListener;
+        if (l != null) {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                ConnectionListener cur = activeListener;
+                if (cur != null) cur.onVolumeChanged(currentVolumePercent);
+            });
         }
     }
 
@@ -139,24 +153,29 @@ public class AudioCaptureService extends Service {
         if (ACTION_VOL_UP.equals(action)) {
             currentVolumePercent = Math.min(100, currentVolumePercent + 5);
             updateNotification();
+            notifyVolumeChanged();
             return START_NOT_STICKY;
         }
 
         if (ACTION_VOL_DOWN.equals(action)) {
             currentVolumePercent = Math.max(0, currentVolumePercent - 5);
             updateNotification();
+            notifyVolumeChanged();
             return START_NOT_STICKY;
         }
 
         if (ACTION_SET_VOL.equals(action)) {
-            currentVolumePercent = intent.getIntExtra(EXTRA_VOLUME, 100);
+            currentVolumePercent = intent.getIntExtra(EXTRA_VOLUME, DEFAULT_SAFE_VOLUME);
             updateNotification();
+            notifyVolumeChanged();
             return START_NOT_STICKY;
         }
 
         if (ACTION_START.equals(action)) {
             int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
             Intent resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA);
+            currentVolumePercent = DEFAULT_SAFE_VOLUME; // Always reset to safe volume when connecting
+            notifyVolumeChanged();
             startForegroundNotification();
             startStreamingFlow(resultCode, resultData);
         }
@@ -182,15 +201,15 @@ public class AudioCaptureService extends Service {
         openIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent piOpen = PendingIntent.getActivity(this, 0, openIntent, flags);
 
-        String title;
+        String statusBrief;
         if (connectionState == STATE_CONNECTED) {
-            title = "WOB: En vivo con REAPER (" + currentVolumePercent + "%)";
+            statusBrief = "🟢 En vivo";
         } else if (connectionState == STATE_SEARCHING) {
-            title = "WOB: Buscando a REAPER...";
+            statusBrief = "🟡 Buscando...";
         } else if (connectionState == STATE_RECONNECTING) {
-            title = "WOB: Reconectando senal...";
+            statusBrief = "🟠 Reconectando...";
         } else {
-            title = "WOB: Inactivo";
+            statusBrief = "Inactivo";
         }
 
         Notification.Builder builder;
@@ -200,8 +219,9 @@ public class AudioCaptureService extends Service {
             builder = new Notification.Builder(this);
         }
 
-        builder.setContentTitle(title)
-                .setContentText(connectionInfo)
+        // Clean, simple notification: Volume is front and center, never truncated!
+        builder.setContentTitle("Volumen: " + currentVolumePercent + "%")
+                .setContentText(statusBrief)
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .addAction(R.drawable.ic_minus, "-", piDown)
                 .addAction(R.drawable.ic_plus, "+", piUp)

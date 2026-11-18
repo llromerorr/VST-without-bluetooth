@@ -122,6 +122,14 @@ public class MainActivity extends Activity implements AudioCaptureService.Connec
         runOnUiThread(() -> updateUiState(state, message));
     }
 
+    @Override
+    public void onVolumeChanged(int volumePercent) {
+        runOnUiThread(() -> {
+            seekVolume.setProgress(volumePercent);
+            txtVolume.setText("VOLUMEN: " + volumePercent + "%");
+        });
+    }
+
     private void updateUiState(int state, String message) {
         switch (state) {
             case AudioCaptureService.STATE_CONNECTED:
@@ -191,6 +199,8 @@ public class MainActivity extends Activity implements AudioCaptureService.Connec
                 }
 
                 AudioCaptureService.isRunning = true;
+                seekVolume.setProgress(AudioCaptureService.DEFAULT_SAFE_VOLUME);
+                txtVolume.setText("VOLUMEN: " + AudioCaptureService.DEFAULT_SAFE_VOLUME + "%");
                 updateUiState(AudioCaptureService.STATE_SEARCHING, "Buscando REAPER en tu red local...");
             } else {
                 Toast.makeText(this, "Permiso de captura denegado", Toast.LENGTH_SHORT).show();
