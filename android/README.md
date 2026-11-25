@@ -1,20 +1,18 @@
-# WOB 4.0 - App Android (Universal: Android 5.0 a 15+)
+# WOB 5.0 - App Android (Universal: Android 5.0 a 15+)
 
-Aplicación emisora para **WOB 4.0 (Without Bluetooth)**. Captura el flujo de audio digital interno de cualquier reproductor (YouTube, Spotify, pistas de ensayo) y lo envía en tiempo real por Wi-Fi UDP a REAPER / DAW con handshake real bidireccional y auto-recuperación de enlace.
+Aplicación emisora de nivel broadcast para **WOB 5.0 (Without Bluetooth)**. Captura el audio digital interno del sistema y lo transmite hacia REAPER / DAW con arquitectura multi-hilo desacoplada, protección contra saturación Wi-Fi y auto-adaptación transparente.
 
-## Novedades en la Versión 4.0
-- **Handshake Real Bidireccional:** Semáforo de estados en vivo (Amarillo = Buscando a REAPER, Verde = Confirmado y transmitiendo en vivo, Naranja = Señal débil/reconectando).
-- **Fin a la Falsa Conexión:** La app no finge conexión ni envía audio a ciegas; solo transmite cuando REAPER ha respondido afirmativamente.
-- **Heartbeat & Auto-Reconexión:** Monitoriza acuses de recibo periódicos desde el DAW. Si la señal Wi-Fi cae temporalmente por paredes, la app reintenta el enlace sola en segundo plano sin reiniciar la app.
-- **Compatibilidad Universal Total:** Compatible desde Android 5.0 (Lollipop) hasta Android 15+ (`minSdkVersion=21`, `targetSdkVersion=34`).
-- **Soporte Completo para Android 14+:** Registro nativo de `MediaProjection.Callback` y permisos de primer plano de proyección de medios.
-- **MulticastLock de Hardware:** Habilita el paso de paquetes UDP de broadcast en procesadores MediaTek, Transsion (Tecno/Infinix), Qualcomm y Exynos.
-- **Controles de Volumen Dual:** Botones fijos `[-]` y `[+]` siempre visibles en la notificación compacta (`MediaStyle`) y fader en pantalla (0% a 100%).
-- **Persistencia en Segundo Plano:** `WakeLock`, `WifiLock` de alto rendimiento y exención de optimización de batería.
+## Novedades en la Versión 5.0
+- **Arquitectura Desacoplada sin Bloqueos (Zero-GC):** Hilo dedicado de captura separado del hilo de red UDP mediante anillo en memoria (`512 ms`) para impedir pérdidas de muestras cuando el chip Wi-Fi sufre contención.
+- **Compresión Auto-Adaptativa BFP-8 / BFP-6 + XOR FEC:** Reduce a más de la mitad la tasa de paquetes por segundo (`62.5 pps` en modo congestionado) y añade paquetes de paridad XOR para curar pérdidas en 0 ms.
+- **Caché de Retransmisión Selectiva (`NA_NACK`):** Conserva ~2 segundos de tramas codificadas en memoria y responde al instante a solicitudes `NA_NACK` desde REAPER.
+- **Aislamiento de Red Wi-Fi + Prioridad WMM QoS:** Vincula explícitamente el socket UDP al transporte Wi-Fi/Ethernet (`Network.bindSocket`) evitando saltos a datos móviles 4G/5G y marca tráfico con prioridad `DSCP EF` (`0xB8`).
+- **Descubrimiento Limpio Multi-Subred:** Soporte automático de subredes `/22`, `/23`, `/24` y USB Tethering sin tormentas ARP sobre redes ocupadas.
+- **Volumen Seguro y Notificación Clara:** Inicia siempre en `65%` al conectar y muestra `Volumen: XX%` de forma directa en la notificación con botones compactos `[-]`/`[+]`.
 
 ## Compilación
 Requiere **Android SDK Build-Tools** y **JDK**:
 ```cmd
 build_apk.bat
 ```
-Generará `bin\WOB-4.0.apk` y `bin\WOB.apk`.
+Generará `bin\WOB-5.0.apk` y `bin\WOB.apk`.

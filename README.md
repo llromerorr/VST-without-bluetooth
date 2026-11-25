@@ -1,115 +1,83 @@
-# WOB 4.0 (Without Bluetooth) 🚀
-### Transmisión de Audio Wi-Fi Blindada y Auto-Adaptativa de Android a REAPER / DAWs
+# WOB 5.0 (Without Bluetooth) 🚀
+### Transmisión de Audio Wi-Fi Nivel Broadcast en Vivo (Cero Cortes para Eventos e Iglesias)
 
-[![Release](https://img.shields.io/github/v/release/llromerorr/VST-without-bluetooth?color=blue&label=Versi%C3%B3n%204.0)](https://github.com/llromerorr/VST-without-bluetooth/releases)
+[![Release](https://img.shields.io/github/v/release/llromerorr/VST-without-bluetooth?color=blue&label=Versi%C3%B3n%205.0)](https://github.com/llromerorr/VST-without-bluetooth/releases)
 [![Platform](https://img.shields.io/badge/Plataforma-Windows%2064bit%20%7C%20Android%205.0%20a%2015%2B-blue.svg)](#)
 [![Format](https://img.shields.io/badge/Formato-VST2%2064--bit-orange.svg)](#)
-[![Buffer](https://img.shields.io/badge/BÃºfer-Auto--Adaptativo%20(60--220ms)-brightgreen.svg)](#)
+[![Protection](https://img.shields.io/badge/Protecci%C3%B3n-XOR%20FEC%20%2B%20NACK%20%2B%20B%C3%BAfer%20850ms-brightgreen.svg)](#)
 [![License](https://img.shields.io/badge/Licencia-MIT-purple.svg)](#)
 
-**WOB 4.0** (*Without Bluetooth*) es una solución profesional, de código abierto y cero configuración para transmitir todo el audio digital interno de tu teléfono Android (YouTube, Spotify, pistas de ensayo de baile, grabaciones) directamente a tu DAW (**REAPER**, Ableton, FL Studio, Cubase, etc.) a través de tu red Wi-Fi local, manteniendo el parlante del teléfono en silencio absoluto y con **estabilidad blindada contra interferencias**, sin silencios, sin trabas y sin desfases musicales.
+**WOB 5.0** (*Without Bluetooth*) es una solución profesional de código abierto y cero configuración diseñada para transmitir audio interno de Android en **ambientes en vivo críticos (iglesias llenas, auditorios y eventos)** hacia **REAPER / DAWs** en Windows, resistiendo redes Wi-Fi saturadas por cientos de dispositivos sin tartamudeos, silencios ni caídas.
 
 ---
 
-## 📥 Descargas Oficiales (Versión 4.0)
+## 📥 Descargas Oficiales (Versión 5.0)
 
-Descarga los binarios precompilados de la **Versión 4.0** directamente desde [**GitHub Releases**](https://github.com/llromerorr/VST-without-bluetooth/releases):
+Descarga los binarios precompilados de la **Versión 5.0** directamente desde [**GitHub Releases**](https://github.com/llromerorr/VST-without-bluetooth/releases):
 
 | Componente | Archivo de Descarga Directa | Descripción |
 | :--- | :--- | :--- |
-| **Plugin VST2 (Windows 64-bit)** | [👉 **Descargar WOB-4.0.dll**](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB-4.0.dll) | Plugin de 64 bits para REAPER u otro DAW en Windows. |
-| **App Móvil (Android Universal)** | [👉 **Descargar WOB-4.0.apk**](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB-4.0.apk) | App para Android 5.0 hasta Android 15+ con autodescubrimiento real. |
+| **Plugin VST2 (Windows 64-bit)** | [👉 **Descargar WOB-5.0.dll**](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB-5.0.dll) | Plugin receptor de 64 bits con decodificador BFP, XOR FEC, NACK y PLC. |
+| **App Móvil (Android Universal)** | [👉 **Descargar WOB-5.0.apk**](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB-5.0.apk) | App para Android 5.0 hasta Android 15+ con QoS Wi-Fi y auto-protección. |
 
 *(También disponibles con nombres cortos: [`WOB.dll`](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB.dll) y [`WOB.apk`](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB.apk))*
 
 ---
 
-## 🌟 Novedades y Mejoras en WOB 4.0
+## 🛡️ Arquitectura Anti-Cortes en WOB 5.0
 
-* **🧠 Búfer Inteligente Auto-Adaptativo (Cero Modos, Cero Complicaciones):**  
-  No requiere que el usuario elija modos ni ajuste números. El plugin en REAPER mide constantemente en milisegundos el *jitter* y la estabilidad de llegada de los paquetes:
-  - Cerca de la PC en red estable: mantiene un búfer ágil (~60 ms).
-  - Al caminar por la casa, atravesar paredes o en redes 2.4 GHz congestionadas con muchos dispositivos: **expande automáticamente el colchón hasta 220 ms** antes de que el búfer se vacíe, absorbiendo cualquier bache de señal sin que el audio se silencie ni tartamudee.
-* **🤝 Handshake Real Bidireccional (Fin al Falso "Conectado"):**  
-  Se terminó la sensación de que la app está rota al conectarse:
-  - 🟡 **Amarillo (Buscando...):** La app explora la red local en tiempo real y no finge conexión hasta tener confirmación de REAPER.
-  - 🟢 **Verde (Conectado a REAPER - En vivo):** Se activa únicamente cuando REAPER respondió afirmativamente (`NA_OFFER`), confirmando el inicio de streaming y mostrando la IP del ordenador.
-  - 🟠 **Naranja (Reconectando señal...):** Si la señal Wi-Fi cae temporalmente al cambiar de habitación, la app lo detecta al instante y reintenta el enlace sola en segundo plano, volviendo a verde sin intervención manual.
-* **💓 Heartbeats y Telemetría de Vuelta:**  
-  REAPER emite acuses de recibo periódicos (`NA_ACK`) hacia el teléfono para certificar que el audio está sonando en el DAW.
-* **🛡️ Ocultamiento Suave de Pérdidas (PLC):**  
-  Si un micro-bache extremo agota el búfer temporalmente, el plugin aplica un desvanecimiento exponencial suave en lugar de cortar a silencio abrupto.
-* **📱 Compatibilidad Universal Total (Android 5.0 a Android 15+):**  
-  Cumple con los requisitos de `targetSdkVersion 34`, callbacks de `MediaProjection` y permisos de servicios en primer plano.
-* **⚡ MulticastLock de Hardware:**  
-  Permite la transmisión sin bloqueos en chips MediaTek, Transsion (Tecno/Infinix), Qualcomm y Exynos.
-* **🎚️ Control de Volumen Dual:**  
-  Botones `[-]` y `[+]` fijados en la notificación compacta (`MediaStyle`) y fader digital en pantalla (0% a 100%).
+* **📡 Compresión Adaptativa de Alta Fidelidad (BFP-8 / BFP-6 Noise-Shaped):**
+  - En redes limpias transmite a **85+ dB SNR audible (BFP-8)** con la mitad de paquetes por segundo que versiones anteriores.
+  - Cuando cientos de celulares saturan el router Wi-Fi, **cambia automáticamente en caliente a BFP-6 empaquetado doble (`62.5 pps`, ~600 kbps)** reduciendo drásticamente el tiempo aire ocupado en el Wi-Fi sin pérdida perceptible en PA.
+  - Compresión de silencio digital a `0 bytes` en pausas entre canciones o sermones.
+* **🧬 Corrección de Errores XOR FEC + Retransmisión Selectiva (NACK):**
+  - **FEC (0 ms de espera):** Paquetes de paridad XOR reparan pérdidas aleatorias al instante sin pedir retransmisión.
+  - **Selective `NA_NACK` (cierre de baches largos):** Si una interferencia fuerte borra múltiples paquetes consecutivos (hasta 180+ ms), REAPER solicita exactamente las tramas faltantes y Android las reenvía desde su historial de 2 segundos antes de que el cabezal de reproducción llegue al hueco.
+* **🧠 Búfer Elástico Blindado (220 ms a 850 ms) con Alta Precisión `QPC`:**
+  - Medición de *jitter* por microsegundos (`QueryPerformanceCounter`).
+  - Aprovecha micro-pausas silenciosas para ampliar el colchón instantáneamente sin alterar el tono ni detener la música.
+  - Si un corte extremo vacía la cola, aplica PLC por similitud de ciclo de onda (*pitch-matched*) y espera a recargar el colchón completo en silencio suave en lugar de tartamudear.
+* **🚀 Prioridad Hardware Wi-Fi (WMM DSCP QoS) & Aislamiento LAN:**
+  - Fija el socket directamente al adaptador Wi-Fi/Ethernet (`Network.bindSocket`) evitando que Android cambie tráfico a datos móviles 4G/5G cuando el Wi-Fi está ocupado.
+  - Marca paquetes UDP con prioridad **DSCP EF (`0xB8` / WMM Voice)** para adelantarse al tráfico normal de redes sociales de otros asistentes.
+  - Descubrimiento sin inundación compatible con subredes grandes `/22`, `/23` y `/24`, además de tethering USB.
+* **🔒 Seguridad y Control Visual:**
+  - Volumen inicial seguro (**65%**) al conectar para evitar golpes de sonido en consola.
+  - Notificación simplificada con lectura directa (`Volumen: XX%`, estado claro `🟢 En vivo`) y botones `[-]`/`[+]`.
+  - La ventana VST en REAPER muestra **IP local de la PC**, tier activo, búfer en ms, jitter, pérdida y paquetes recuperados por FEC/NACK.
 
 ---
 
 ## 🎬 Guía Rápida de Instalación y Uso
 
 ### 1. En la Computadora (REAPER / DAW)
-1. Descarga [`WOB-4.0.dll`](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB-4.0.dll).
+1. Descarga [`WOB-5.0.dll`](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB-5.0.dll).
 2. Cópialo a tu carpeta de VSTs habitual:
    ```text
    C:\Program Files\VSTPlugins\
    ```
    *(o en la carpeta FX de REAPER: `C:\Program Files\REAPER (x64)\Plugins\FX\`)*
 3. En **REAPER**:
-   * Abre `Options` -> `Preferences` -> `Plug-ins` -> `VST`.
-   * Presiona **Re-scan**.
-   * Agrega un nuevo track y en la ventana de FX busca **`WOB 4.0`**.
-   * La interfaz Win32 se abrirá mostrando el estado, el búfer auto-adaptativo y el medidor VU en vivo.
+   * Abre `Options` -> `Preferences` -> `Plug-ins` -> `VST` y presiona **Re-scan**.
+   * Agrega un track y carga **`WOB 5.0`**.
 
 > **Importante (Firewall de Windows):** Asegúrate de permitir el acceso en redes privadas para REAPER o el puerto UDP `58200`.
 
----
-
 ### 2. En el Teléfono Android
-1. Descarga e instala [`WOB-4.0.apk`](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB-4.0.apk).
-2. Abre la app **WOB**.
-3. Toca el botón central **CONECTAR**.
-4. Acepta el permiso de captura de audio del sistema (*"Iniciar ahora"*).
-5. Verás cómo el botón pasa de amarillo a verde confirmado en menos de un segundo.
-6. Abre YouTube, Spotify o tus pistas de ensayo: el sonido sonará inmediatamente por tu PC sin cortes, aunque camines por toda la casa.
+1. Descarga e instala [`WOB-5.0.apk`](https://github.com/llromerorr/VST-without-bluetooth/releases/latest/download/WOB-5.0.apk).
+2. Abre **WOB**, toca **CONECTAR** y acepta el permiso de captura.
+3. El volumen iniciará de forma segura al **65%**; ajústalo desde la pantalla o la notificación.
 
 ---
 
-## 📐 Arquitectura Técnica
-
-```mermaid
-flowchart LR
-    subgraph Android["📱 Teléfono Android (5.0 a 15+)"]
-        App["App de Música\n(YouTube / Spotify)"] -->|"Digital PCM 48kHz"| APC["AudioPlaybackCapture\n+ MediaProjection"]
-        APC --> Fader["Fader Digital\n(0 - 100%)"]
-        Fader --> UDP_Send["UDP Socket\nPuerto 58200"]
-        ACK_Recv["ACK Heartbeat Listener\n(Detector de Caídas)"] -. "Estado Real" .-> UI["UI Semáforo\n(Amarillo / Verde / Naranja)"]
-    end
-
-    UDP_Send -. "Wi-Fi LAN (UDP Audio)" .-> UDP_Recv
-    ACK_Send -. "Wi-Fi LAN (NA_ACK Heartbeat)" .-> ACK_Recv
-
-    subgraph PC["💻 Windows PC (DAW / REAPER)"]
-        UDP_Recv["UDP Receiver\nPuerto 58200"] --> JitterDetect["Jitter & Loss Monitor\n(Calculador de Retrasos)"]
-        JitterDetect --> AdaptBuf["Adaptive Ring Buffer\n(Auto 60ms a 220ms)"]
-        AdaptBuf --> Resampler["Linear Resampler\n+ Proportional Clock Steering"]
-        Resampler --> Mixer["Multi-Client Summer\n+ Soft Limiter"]
-        Mixer --> AudioOut["ASIO / Monitores de Estudio"]
-        UDP_Recv --> ACK_Send["ACK Transmitter\n(Heartbeat cada 200ms)"]
-    end
-```
-
-### Especificaciones de Audio
+### Especificaciones de Audio (WOB 5.0)
 | Parámetro | Especificación |
 | :--- | :--- |
-| **Protocolo** | UDP Bidireccional con Handshake & Heartbeat (Puerto `58200`) |
-| **Formato de Transmisión** | PCM 16-bit estéreo Little-Endian |
-| **Frecuencia de Captura** | 48,000 Hz (Nativo de hardware Android) |
-| **Frecuencia de Salida** | Auto-adaptable al host (44,100 Hz, 48,000 Hz, 96,000 Hz) |
-| **Colchón Elástico (Jitter Cushion)** | **60 ms a 220 ms (Auto-Adaptativo Dinámico)** |
-| **Recuperación de Caídas** | Reconexión de enlace automática en segundo plano (< 1.5s) |
+| **Protocolo** | UDP Bidireccional (`W5`, Puerto `58200`) con XOR FEC, Selective `NA_NACK` y Telemetría `NA_ACK` |
+| **Codificación** | BFP-8 (`~800 kbps`) y BFP-6 Dual-Pack (`~600 kbps`, `62.5 pps`) auto-adaptativos |
+| **Frecuencia de Captura / Salida** | 48,000 Hz Estéreo / Adaptable al DAW (44.1 / 48 / 96 kHz) |
+| **Búfer Auto-Adaptativo** | **220 ms iniciales, auto-expansivo hasta 850 ms** |
+| **QoS / Red** | DSCP EF (`0xB8`), `Network.bindSocket`, soporte `/22`-`/24` y USB Tethering |
 
 ---
 
@@ -130,19 +98,19 @@ VST-without-bluetooth/
 cd vst
 build_vst.bat
 ```
-Generará `vst/bin/WOB-4.0.dll` y lo copiará a tus carpetas VST.
+Generará `vst/bin/WOB-5.0.dll` y lo copiará a tus carpetas VST.
 
 ### Compilar la App Android (`android/`)
 ```cmd
 cd android
 build_apk.bat
 ```
-Generará `android/bin/WOB-4.0.apk` firmado y zipalineado.
+Generará `android/bin/WOB-5.0.apk` firmado y zipalineado.
 
 ---
 
 ## 🤝 Créditos y Licencia
 
-Desarrollado con ❤️ para músicos, bailarines, productores e ingenieros de sonido que necesitan conectar el audio del teléfono al DAW sin lidiar con los molestos retrasos, desincronizaciones y cortes del Bluetooth.
+Desarrollado con ❤️ para iglesias, músicos, ingenieros de sonido y productores que necesitan audio confiable sobre Wi-Fi en eventos en vivo reales.
 
 Licencia: **MIT License**. Libre para uso personal y comercial.

@@ -52,7 +52,7 @@
             android:id="@+id/txtVolume"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="VOLUMEN: 100%"
+            android:text="VOLUMEN: 65%"
             android:textColor="#00D2D2"
             android:textSize="14sp"
             android:textStyle="bold"
@@ -64,7 +64,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:max="100"
-            android:progress="100" />
+            android:progress="65" />
     </LinearLayout>
 
     <!-- Status -->
