@@ -30,17 +30,12 @@ import android.os.PowerManager;
 import android.os.Process;
 import android.util.Log;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
-import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -57,7 +52,7 @@ public class AudioCaptureService extends Service {
     private static final String PREFS_NAME = "WOBPrefs";
     private static final String KEY_LAST_IP = "last_known_ip";
 
-    // WOB 6.0 Protocol & Frame Constants (exact match with WOB.c)
+    // WOB 6.1 Protocol & Frame Constants (exact match with WOB.c)
     private static final short WOB6_MAGIC = 0x3657;
     private static final int WOB_HDR_LEN = 20;
     private static final int TYPE_DATA = 1;
@@ -74,8 +69,8 @@ public class AudioCaptureService extends Service {
     private static final int FRAME_SIZE_BFP8 = 796;
     private static final int FRAME_SIZE_BFP6 = 604;
 
-    private static final int CAPTURE_RING_SLOTS = 128; // 1.024s decoupling queue
-    private static final int RETX_CACHE_SLOTS = 256;
+    private static final int CAPTURE_RING_SLOTS = 256; // 2.048s non-blocking capture queue
+    private static final int RETX_CACHE_SLOTS = 256;   // 2.048s retransmit cache
 
     public static final String ACTION_START = "ACTION_START";
     public static final String ACTION_STOP = "ACTION_STOP";
@@ -139,9 +134,6 @@ public class AudioCaptureService extends Service {
 
     private MediaProjection mediaProjection;
     private AudioRecord audioRecord;
-    private volatile Socket tcpSocket;
-    private volatile OutputStream tcpOut;
-    private volatile InputStream tcpIn;
     private volatile DatagramSocket udpSocket;
 
     private Thread captureThread;
@@ -149,15 +141,15 @@ public class AudioCaptureService extends Service {
     private Thread ackThread;
     private volatile boolean isCapturing = false;
     private volatile boolean isStreamConfirmed = false;
-    private volatile boolean useTcpMode = false;
     private volatile long lastAckTime = 0;
-    private volatile long writeInFlightStartMs = 0;
 
-    // Auto codec tier (0 = BFP8 HD, 1 = BFP6 Dual-Pack ultra-light 62.5 pps)
+    // Auto Protection Tier:
+    // 0 = HD (BFP8 8ms + light FEC K=5)
+    // 1 = Church Ultra-Light (BFP6 Dual-Pack 16ms = 62.5 pps + FEC K=4 = 78 pps total!)
     private volatile int desiredTier = 0;
     private volatile long lastStressEventMs = 0;
 
-    // Pending UDP NACKs (used only if firewall forces UDP fallback)
+    // Pending selective NACK retransmit requests
     private static final int MAX_PENDING_NACKS = 32;
     private final Object nackLock = new Object();
     private final int[] pendingNackBase = new int[MAX_PENDING_NACKS];
@@ -165,7 +157,7 @@ public class AudioCaptureService extends Service {
     private int pendingNackHead = 0;
     private int pendingNackTail = 0;
 
-    // Decoupled Capture Ring between CaptureThread and SenderThread
+    // Decoupled Capture Ring
     private final Object captureLock = new Object();
     private final short[][] capRingL = new short[CAPTURE_RING_SLOTS][FRAME_SAMPLES];
     private final short[][] capRingR = new short[CAPTURE_RING_SLOTS][FRAME_SAMPLES];
@@ -383,7 +375,7 @@ public class AudioCaptureService extends Service {
     }
 
     // =========================================================================
-    // Wi-Fi / LAN Interface Detection & Socket QoS Helpers
+    // Wi-Fi / LAN Interface Detection & Socket Config (Standard WMM A-MPDU!)
     // =========================================================================
     private Network findBestLocalNetwork() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return null;
@@ -407,34 +399,13 @@ public class AudioCaptureService extends Service {
         return null;
     }
 
-    private void configureUdpSocketQoS(DatagramSocket sock, Network net) {
+    private void configureUdpSocket(DatagramSocket sock, Network net) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && net != null) {
             try { net.bindSocket(sock); } catch (Exception ignored) {}
         }
+        // Keep standard WMM Best-Effort (0x00) instead of AC_VO 0xB8 so hardware A-MPDU aggregation works at full speed!
         try { sock.setSendBufferSize(512 * 1024); } catch (Exception ignored) {}
         try { sock.setReceiveBufferSize(128 * 1024); } catch (Exception ignored) {}
-        try {
-            sock.setTrafficClass(0xB8);
-        } catch (Exception e) {
-            try { sock.setTrafficClass(0x88); } catch (Exception e2) {
-                try { sock.setTrafficClass(0x10); } catch (Exception ignored) {}
-            }
-        }
-    }
-
-    private void configureTcpSocketQoS(Socket sock) {
-        try { sock.setTcpNoDelay(true); } catch (Exception ignored) {}
-        try { sock.setSendBufferSize(64 * 1024); } catch (Exception ignored) {} // Anti-bloat cap (~0.8s max)
-        try { sock.setReceiveBufferSize(64 * 1024); } catch (Exception ignored) {}
-        try { sock.setSoTimeout(350); } catch (Exception ignored) {}
-        try { sock.setKeepAlive(true); } catch (Exception ignored) {}
-        try {
-            sock.setTrafficClass(0xB8);
-        } catch (Exception e) {
-            try { sock.setTrafficClass(0x88); } catch (Exception e2) {
-                try { sock.setTrafficClass(0x10); } catch (Exception ignored) {}
-            }
-        }
     }
 
     private static class SubnetInfo {
@@ -498,7 +469,7 @@ public class AudioCaptureService extends Service {
     private static class DiscoveryResult {
         String ip;
         Network net;
-        int protoVersion; // 6=TCP+UDP, 5=UDP-WOB5, 4=Legacy
+        int protoVersion;
         DiscoveryResult(String ip, Network net, int protoVersion) {
             this.ip = ip;
             this.net = net;
@@ -524,7 +495,7 @@ public class AudioCaptureService extends Service {
                 sock = new DatagramSocket();
                 sock.setBroadcast(true);
                 sock.setSoTimeout(280);
-                configureUdpSocketQoS(sock, net);
+                configureUdpSocket(sock, net);
 
                 if (lastKnownIp != null && !lastKnownIp.isEmpty()) {
                     try {
@@ -555,7 +526,7 @@ public class AudioCaptureService extends Service {
                         if (reply.contains("NA_OFFER")) {
                             String foundIp = recvPkt.getAddress().getHostAddress();
                             prefs.edit().putString(KEY_LAST_IP, foundIp).apply();
-                            int ver = reply.contains("WOB6") ? 6 : (reply.contains("WOB5") ? 5 : 4);
+                            int ver = (reply.contains("WOB6") || reply.contains("WOB5")) ? 6 : 4;
                             sock.close();
                             return new DiscoveryResult(foundIp, net, ver);
                         }
@@ -597,7 +568,7 @@ public class AudioCaptureService extends Service {
                                 if (reply.contains("NA_OFFER")) {
                                     String foundIp = recvPkt.getAddress().getHostAddress();
                                     prefs.edit().putString(KEY_LAST_IP, foundIp).apply();
-                                    int ver = reply.contains("WOB6") ? 6 : (reply.contains("WOB5") ? 5 : 4);
+                                    int ver = (reply.contains("WOB6") || reply.contains("WOB5")) ? 6 : 4;
                                     sock.close();
                                     return new DiscoveryResult(foundIp, net, ver);
                                 }
@@ -731,7 +702,7 @@ public class AudioCaptureService extends Service {
     }
 
     // =========================================================================
-    // Decoupled Audio Capture Thread (NEVER blocks on network)
+    // Exact Partial-Read Safe Audio Capture Thread
     // =========================================================================
     private void runCaptureLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
@@ -741,11 +712,22 @@ public class AudioCaptureService extends Service {
         try {
             audioRecord.startRecording();
             while (isCapturing && audioRecord != null) {
-                int read = audioRecord.read(pcmTmp, 0, interleavedLen, AudioRecord.READ_BLOCKING);
-                if (read == interleavedLen) {
+                int got = 0;
+                while (got < interleavedLen && isCapturing && audioRecord != null) {
+                    int r = audioRecord.read(pcmTmp, got, interleavedLen - got, AudioRecord.READ_BLOCKING);
+                    if (r > 0) {
+                        got += r;
+                    } else if (r < 0) {
+                        break;
+                    } else {
+                        try { Thread.sleep(1); } catch (InterruptedException ignored) { break; }
+                    }
+                }
+
+                if (got == interleavedLen) {
                     int w = capWriteIdx;
                     int r = capReadIdx;
-                    if (w - r >= CAPTURE_RING_SLOTS - 1) {
+                    if (w - r >= CAPTURE_RING_SLOTS - 2) {
                         capReadIdx = w - (CAPTURE_RING_SLOTS / 2);
                     }
 
@@ -783,69 +765,8 @@ public class AudioCaptureService extends Service {
         }
     }
 
-    private void closeTransportQuietly() {
-        writeInFlightStartMs = 0;
-        Socket s = tcpSocket;
-        tcpSocket = null;
-        tcpOut = null;
-        tcpIn = null;
-        if (s != null) {
-            try { s.close(); } catch (Exception ignored) {}
-        }
-        DatagramSocket u = udpSocket;
-        udpSocket = null;
-        if (u != null) {
-            try { u.close(); } catch (Exception ignored) {}
-        }
-        Thread a = ackThread;
-        ackThread = null;
-        if (a != null) {
-            try { a.interrupt(); } catch (Exception ignored) {}
-        }
-    }
-
-    private boolean openTransportConnection() {
-        closeTransportQuietly();
-
-        // Attempt TCP first if REAPER supports WOB 6.0 (0% packet loss, zero FEC waste!)
-        if (serverProtoVersion >= 6) {
-            try {
-                Socket s;
-                if (boundLocalNetwork != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    s = boundLocalNetwork.getSocketFactory().createSocket();
-                } else {
-                    s = new Socket();
-                }
-                s.connect(new InetSocketAddress(targetAddr, TARGET_PORT), 1200);
-                configureTcpSocketQoS(s);
-                tcpOut = s.getOutputStream();
-                tcpIn = s.getInputStream();
-                tcpSocket = s;
-                useTcpMode = true;
-                Log.i(TAG, "Connected via TCP Smart Stream to " + targetIpStr);
-                return true;
-            } catch (Exception e) {
-                Log.w(TAG, "TCP connect failed (" + e.getMessage() + "), falling back to UDP.");
-            }
-        }
-
-        // Automatic UDP Fallback (if Windows firewall blocks TCP port 58200 or server is v4/v5)
-        try {
-            DatagramSocket u = new DatagramSocket();
-            u.setSoTimeout(300);
-            configureUdpSocketQoS(u, boundLocalNetwork);
-            udpSocket = u;
-            useTcpMode = false;
-            Log.i(TAG, "Connected via UDP fallback to " + targetIpStr);
-            return true;
-        } catch (Exception e) {
-            Log.e(TAG, "UDP fallback open failed: " + e.getMessage());
-            return false;
-        }
-    }
-
     // =========================================================================
-    // Main Networking, Self-Healing TCP/UDP Streamer & Watchdog
+    // Pure UDP Pro Streamer (FEC + NACK + Zero Head-of-Line Stalls)
     // =========================================================================
     private void runNetworkingAndSender() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
@@ -885,15 +806,32 @@ public class AudioCaptureService extends Service {
                 return;
             }
 
+            DatagramSocket sock = new DatagramSocket();
+            sock.setSoTimeout(300);
+            configureUdpSocket(sock, boundLocalNetwork);
+            udpSocket = sock;
+
+            final int sessionTag = new Random().nextInt() | 1;
+            lastAckTime = System.currentTimeMillis();
+
+            ackThread = new Thread(this::runAckAndNackListener, "WOB-Ack");
+            ackThread.setDaemon(true);
+            ackThread.start();
+
+            byte[] pingBuf = new byte[WOB_HDR_LEN];
+            ByteBuffer pingBB = ByteBuffer.wrap(pingBuf).order(ByteOrder.LITTLE_ENDIAN);
+            sendPing(pingBuf, pingBB, sessionTag);
+
             captureThread = new Thread(this::runCaptureLoop, "WOB-Capture");
             captureThread.start();
 
-            // Preallocate all zero-GC working buffers once
+            // Preallocate all reusable buffers (Zero GC)
             final byte[][] cacheBytes = new byte[RETX_CACHE_SLOTS][FRAME_SIZE_BFP8];
             final int[] cacheSeq = new int[RETX_CACHE_SLOTS];
             final int[] cacheCodec = new int[RETX_CACHE_SLOTS];
             final int[] cacheLen = new int[RETX_CACHE_SLOTS];
             final long[] cacheLastResent = new long[RETX_CACHE_SLOTS];
+            for (int i = 0; i < RETX_CACHE_SLOTS; i++) cacheSeq[i] = -1;
 
             final byte[] pktBuf = new byte[1400];
             final ByteBuffer pktBB = ByteBuffer.wrap(pktBuf).order(ByteOrder.LITTLE_ENDIAN);
@@ -903,325 +841,237 @@ public class AudioCaptureService extends Service {
             final byte[] fecPktBuf = new byte[1400];
             final ByteBuffer fecBB = ByteBuffer.wrap(fecPktBuf).order(ByteOrder.LITTLE_ENDIAN);
             final DatagramPacket fecOutPkt = new DatagramPacket(fecPktBuf, fecPktBuf.length);
-
-            final byte[] pingBuf = new byte[WOB_HDR_LEN];
-            final ByteBuffer pingBB = ByteBuffer.wrap(pingBuf).order(ByteOrder.LITTLE_ENDIAN);
             final int[] scratchQ = new int[FRAME_SAMPLES];
-            final Random rng = new Random();
 
-            // Outer Auto-Reconnect Loop (heals seamlessly on Wi-Fi dropouts without interrupting AudioRecord)
+            int frameSeq = 0;
+            int pktSeq = 0;
+            int activeTier = 0;
+            int fecK = 5; // Gentle 20% parity in Tier 0
+            int fecIdx = 0;
+            int fecBasePkt = 0;
+            int xorMaxLen = 0;
+
+            long lastKeepAliveMs = System.currentTimeMillis();
+            long lastProbeMs = 0;
+
             while (isCapturing) {
-                if (!openTransportConnection()) {
-                    updateState(STATE_RECONNECTING, "Sin enlace Wi-Fi. Reintentando...");
-                    DiscoveryResult redir = discoverTargetPC(true);
-                    if (redir != null) {
-                        targetIpStr = redir.ip;
-                        targetAddr = InetAddress.getByName(redir.ip);
-                        serverProtoVersion = redir.protoVersion;
-                        boundLocalNetwork = redir.net;
+                long now = System.currentTimeMillis();
+
+                processPendingNacks(cacheSeq, cacheCodec, cacheBytes, cacheLen, cacheLastResent, pktBuf, pktBB, outPkt, sessionTag, now);
+
+                // Heartbeat monitor & clean non-intrusive probe if ACKs go quiet
+                if (now - lastAckTime > 4000) {
+                    if (connectionState == STATE_CONNECTED) {
+                        isStreamConfirmed = false;
+                        updateState(STATE_RECONNECTING, "Senal debil en Wi-Fi. Re-enlazando...");
                     }
-                    try { Thread.sleep(600); } catch (InterruptedException ignored) { break; }
+                    if (now - lastProbeMs > 2800) {
+                        lastProbeMs = now;
+                        sendPing(pingBuf, pingBB, sessionTag);
+                        try {
+                            byte[] discMsg = "NA_DISCOVER".getBytes();
+                            sock.send(new DatagramPacket(discMsg, discMsg.length, targetAddr, TARGET_PORT));
+                        } catch (Exception ignored) {}
+                    }
+                } else if (desiredTier > 0 && (now - lastStressEventMs) > 60000L) {
+                    desiredTier = 0;
+                    lastStressEventMs = now;
+                }
+
+                // Switch tier cleanly at FEC group boundary:
+                // Tier 0: BFP-8 (125 pps) + K=5 XOR (150 pps)
+                // Tier 1: BFP-6 Dual-Pack (62.5 pps) + K=4 XOR (78 pps total, ultra low airtime!)
+                if (fecIdx == 0 && activeTier != desiredTier) {
+                    activeTier = desiredTier;
+                    fecK = (activeTier == 0) ? 5 : 4;
+                }
+
+                int framesNeeded = (activeTier == 0 || serverProtoVersion == 4) ? 1 : 2;
+                int available = capWriteIdx - capReadIdx;
+
+                if (available < framesNeeded) {
+                    if (now - lastKeepAliveMs > 180) {
+                        sendPing(pingBuf, pingBB, sessionTag);
+                        lastKeepAliveMs = now;
+                    }
+                    synchronized (captureLock) {
+                        try { captureLock.wait(12); } catch (InterruptedException ignored) {}
+                    }
                     continue;
                 }
 
-                for (int i = 0; i < RETX_CACHE_SLOTS; i++) cacheSeq[i] = -1;
-                synchronized (nackLock) {
-                    pendingNackHead = 0;
-                    pendingNackTail = 0;
-                }
-                // Drop excess stale buffered audio on fresh socket reconnect (keep freshest ~120ms)
-                int wNow = capWriteIdx;
-                if (wNow - capReadIdx > 16) {
-                    capReadIdx = wNow - 16;
-                }
+                int r0Idx = capReadIdx;
+                int slot0 = r0Idx & (CAPTURE_RING_SLOTS - 1);
+                short[] L0 = capRingL[slot0];
+                short[] R0 = capRingR[slot0];
 
-                final int sessionTag = rng.nextInt() | 1;
-                lastAckTime = System.currentTimeMillis();
-
-                ackThread = new Thread(this::runAckListener, "WOB-Ack");
-                ackThread.setDaemon(true);
-                ackThread.start();
-
-                sendControlPing(pingBuf, pingBB, sessionTag);
-
-                int frameSeq = 0;
-                int pktSeq = 0;
-                int activeTier = desiredTier;
-                int fecK = (activeTier == 0) ? 4 : 2;
-                int fecIdx = 0;
-                int fecBasePkt = 0;
-                int xorMaxLen = 0;
-                long lastKeepAliveMs = System.currentTimeMillis();
-
-                while (isCapturing) {
-                    long now = System.currentTimeMillis();
-
-                    // Watchdog check: if ACK went silent > 4.2s on dead link -> cleanly cycle socket!
-                    if (now - lastAckTime > 4200) {
-                        isStreamConfirmed = false;
-                        updateState(STATE_RECONNECTING, "Reconectando enlace Wi-Fi...");
-                        break; // Reconnects cleanly in outer loop!
-                    }
-
-                    // Cautious demotion from BFP6 -> BFP8 after 60s clean link
-                    if (desiredTier > 0 && (now - lastStressEventMs) > 60000L) {
-                        desiredTier = 0;
-                        lastStressEventMs = now;
-                    }
-
-                    if (!useTcpMode) {
-                        processPendingUdpNacks(cacheSeq, cacheCodec, cacheBytes, cacheLen, cacheLastResent, pktBuf, pktBB, outPkt, sessionTag, now);
-                    }
-
-                    if (fecIdx == 0 && activeTier != desiredTier) {
-                        activeTier = desiredTier;
-                        fecK = (activeTier == 0) ? 4 : 2;
-                    }
-
-                    // In Tier 0 (HD): 1 frame per write (8ms, BFP8). In Tier 1 (Crowded Church): 2 frames per write (16ms = 62.5 pps, BFP6!)
-                    int framesNeeded = (activeTier == 0 || serverProtoVersion < 5) ? 1 : 2;
-                    int available = capWriteIdx - capReadIdx;
-
-                    if (available < framesNeeded) {
-                        if (now - lastKeepAliveMs > 180) {
-                            if (!sendControlPing(pingBuf, pingBB, sessionTag)) break;
-                            lastKeepAliveMs = now;
+                if (serverProtoVersion == 4) {
+                    capReadIdx = r0Idx + 1;
+                    for (int half = 0; half < 2; half++) {
+                        int off = half * 192;
+                        pktBB.clear();
+                        pktBB.putShort((short) 0x4E41);
+                        pktBB.putShort((short) (frameSeq++ & 0xFFFF));
+                        for (int i = off; i < off + 192; i++) {
+                            pktBB.putShort(L0[i]);
+                            pktBB.putShort(R0[i]);
                         }
-                        synchronized (captureLock) {
-                            try { captureLock.wait(12); } catch (InterruptedException ignored) {}
-                        }
-                        continue;
-                    }
-
-                    // If TCP stalled momentarily and capture ring filled > 750ms, trim oldest frames smoothly
-                    if (available > 94) {
-                        capReadIdx += (available - 48);
-                    }
-
-                    int r0Idx = capReadIdx;
-                    int slot0 = r0Idx & (CAPTURE_RING_SLOTS - 1);
-                    short[] L0 = capRingL[slot0];
-                    short[] R0 = capRingR[slot0];
-
-                    if (serverProtoVersion == 4) {
-                        capReadIdx = r0Idx + 1;
-                        for (int half = 0; half < 2; half++) {
-                            int off = half * 192;
-                            pktBB.clear();
-                            pktBB.putShort((short) 0x4E41);
-                            pktBB.putShort((short) (frameSeq++ & 0xFFFF));
-                            for (int i = off; i < off + 192; i++) {
-                                pktBB.putShort(L0[i]);
-                                pktBB.putShort(R0[i]);
-                            }
-                            outPkt.setData(pktBuf, 0, 4 + 192 * 4);
-                            outPkt.setAddress(targetAddr);
-                            outPkt.setPort(TARGET_PORT);
-                            try { udpSocket.send(outPkt); lastKeepAliveMs = now; } catch (Exception ignored) {}
-                        }
-                        continue;
-                    }
-
-                    if (!useTcpMode && fecIdx == 0) {
-                        fecBasePkt = pktSeq;
-                        xorMaxLen = 0;
-                        java.util.Arrays.fill(xorBuf, (byte) 0);
-                    }
-
-                    int pktCodec;
-                    int payloadLen;
-                    int pktFrameSeq = frameSeq;
-
-                    if (framesNeeded == 1) {
-                        capReadIdx = r0Idx + 1;
-                        boolean sil = isDigitalZero(L0, R0);
-                        pktCodec = sil ? CODEC_SILENCE : CODEC_BFP8;
-                        payloadLen = encodeFrame(L0, R0, pktCodec, pktBuf, WOB_HDR_LEN, scratchQ);
-
-                        if (!useTcpMode) {
-                            int cs = pktFrameSeq & (RETX_CACHE_SLOTS - 1);
-                            cacheSeq[cs] = pktFrameSeq; cacheCodec[cs] = pktCodec; cacheLen[cs] = payloadLen;
-                            if (payloadLen > 0) System.arraycopy(pktBuf, WOB_HDR_LEN, cacheBytes[cs], 0, payloadLen);
-                        }
-                        frameSeq++;
-                    } else {
-                        int r1Idx = r0Idx + 1;
-                        int slot1 = r1Idx & (CAPTURE_RING_SLOTS - 1);
-                        short[] L1 = capRingL[slot1];
-                        short[] R1 = capRingR[slot1];
-                        capReadIdx = r0Idx + 2;
-
-                        boolean sil0 = isDigitalZero(L0, R0);
-                        boolean sil1 = isDigitalZero(L1, R1);
-
-                        if (sil0 && sil1) {
-                            pktCodec = CODEC_SILENCE;
-                            payloadLen = 0;
-                            if (!useTcpMode) {
-                                int cs0 = pktFrameSeq & (RETX_CACHE_SLOTS - 1);
-                                cacheSeq[cs0] = pktFrameSeq; cacheCodec[cs0] = CODEC_SILENCE; cacheLen[cs0] = 0;
-                                int cs1 = (pktFrameSeq + 1) & (RETX_CACHE_SLOTS - 1);
-                                cacheSeq[cs1] = pktFrameSeq + 1; cacheCodec[cs1] = CODEC_SILENCE; cacheLen[cs1] = 0;
-                            }
-                        } else {
-                            pktCodec = CODEC_BFP6;
-                            int len0 = encodeFrame(L0, R0, CODEC_BFP6, pktBuf, WOB_HDR_LEN, scratchQ);
-                            int len1 = encodeFrame(L1, R1, CODEC_BFP6, pktBuf, WOB_HDR_LEN + len0, scratchQ);
-                            payloadLen = len0 + len1;
-
-                            if (!useTcpMode) {
-                                int cs0 = pktFrameSeq & (RETX_CACHE_SLOTS - 1);
-                                cacheSeq[cs0] = pktFrameSeq; cacheCodec[cs0] = CODEC_BFP6; cacheLen[cs0] = len0;
-                                System.arraycopy(pktBuf, WOB_HDR_LEN, cacheBytes[cs0], 0, len0);
-                                int cs1 = (pktFrameSeq + 1) & (RETX_CACHE_SLOTS - 1);
-                                cacheSeq[cs1] = pktFrameSeq + 1; cacheCodec[cs1] = CODEC_BFP6; cacheLen[cs1] = len1;
-                                System.arraycopy(pktBuf, WOB_HDR_LEN + len0, cacheBytes[cs1], 0, len1);
-                            }
-                        }
-                        frameSeq += 2;
-                    }
-
-                    int flagsByte = (pktCodec & 0x07) | ((framesNeeded & 0x03) << 3) | ((activeTier & 0x01) << 6);
-
-                    pktBB.clear();
-                    pktBB.putShort(WOB6_MAGIC);
-                    pktBB.put((byte) TYPE_DATA);
-                    pktBB.put((byte) flagsByte);
-                    pktBB.putInt(pktFrameSeq);
-                    pktBB.putInt(useTcpMode ? 0 : fecBasePkt);
-                    pktBB.put((byte) (useTcpMode ? 0 : fecIdx));
-                    pktBB.put((byte) (useTcpMode ? 0 : fecK));
-                    pktBB.putShort((short) payloadLen);
-                    pktBB.putInt(sessionTag);
-
-                    if (useTcpMode) {
-                        OutputStream out = tcpOut;
-                        if (out == null) break;
-                        try {
-                            long t0 = System.currentTimeMillis();
-                            writeInFlightStartMs = t0;
-                            out.write(pktBuf, 0, WOB_HDR_LEN + payloadLen);
-                            writeInFlightStartMs = 0;
-                            long elapsed = System.currentTimeMillis() - t0;
-                            lastKeepAliveMs = now;
-                            // If a TCP write ever takes > 25ms due to Wi-Fi stall, promote cleanly to compact BFP-6 mode!
-                            if (elapsed > 25 && desiredTier == 0) {
-                                desiredTier = 1;
-                                lastStressEventMs = now;
-                            }
-                        } catch (IOException e) {
-                            writeInFlightStartMs = 0;
-                            Log.w(TAG, "TCP write broken (" + e.getMessage() + "), reconnecting...");
-                            updateState(STATE_RECONNECTING, "Reconectando Wi-Fi...");
-                            break;
-                        }
-                    } else {
-                        outPkt.setData(pktBuf, 0, WOB_HDR_LEN + payloadLen);
+                        outPkt.setData(pktBuf, 0, 4 + 192 * 4);
                         outPkt.setAddress(targetAddr);
                         outPkt.setPort(TARGET_PORT);
-                        try {
-                            udpSocket.send(outPkt);
-                            lastKeepAliveMs = now;
-                        } catch (Exception ignored) {}
-
-                        if (fecK >= 2) {
-                            int totalXorSpan = 7 + payloadLen;
-                            if (totalXorSpan > xorMaxLen) xorMaxLen = totalXorSpan;
-
-                            xorBuf[0] ^= (byte) flagsByte;
-                            xorBuf[1] ^= (byte) (pktFrameSeq & 0xFF);
-                            xorBuf[2] ^= (byte) ((pktFrameSeq >> 8) & 0xFF);
-                            xorBuf[3] ^= (byte) ((pktFrameSeq >> 16) & 0xFF);
-                            xorBuf[4] ^= (byte) ((pktFrameSeq >> 24) & 0xFF);
-                            xorBuf[5] ^= (byte) (payloadLen & 0xFF);
-                            xorBuf[6] ^= (byte) ((payloadLen >> 8) & 0xFF);
-                            for (int k = 0; k < payloadLen; k++) {
-                                xorBuf[7 + k] ^= pktBuf[WOB_HDR_LEN + k];
-                            }
-
-                            fecIdx++;
-                            if (fecIdx >= fecK) {
-                                fecBB.clear();
-                                fecBB.putShort(WOB6_MAGIC);
-                                fecBB.put((byte) TYPE_FEC_XOR);
-                                fecBB.put((byte) ((activeTier & 0x01) << 6));
-                                fecBB.putInt(0);
-                                fecBB.putInt(fecBasePkt);
-                                fecBB.put((byte) fecK);
-                                fecBB.put((byte) fecK);
-                                fecBB.putShort((short) xorMaxLen);
-                                fecBB.putInt(sessionTag);
-                                System.arraycopy(xorBuf, 0, fecPktBuf, WOB_HDR_LEN, xorMaxLen);
-
-                                fecOutPkt.setData(fecPktBuf, 0, WOB_HDR_LEN + xorMaxLen);
-                                fecOutPkt.setAddress(targetAddr);
-                                fecOutPkt.setPort(TARGET_PORT);
-                                try { udpSocket.send(fecOutPkt); } catch (Exception ignored) {}
-                                fecIdx = 0;
-                            }
-                        }
+                        try { sock.send(outPkt); lastKeepAliveMs = now; } catch (Exception ignored) {}
                     }
-                    pktSeq++;
+                    continue;
                 }
 
-                closeTransportQuietly();
-                if (isCapturing) {
-                    try { Thread.sleep(250); } catch (InterruptedException ignored) { break; }
+                if (fecIdx == 0) {
+                    fecBasePkt = pktSeq;
+                    xorMaxLen = 0;
+                    java.util.Arrays.fill(xorBuf, (byte) 0);
                 }
+
+                int pktCodec;
+                int payloadLen;
+                int pktFrameSeq = frameSeq;
+
+                if (framesNeeded == 1) {
+                    capReadIdx = r0Idx + 1;
+                    boolean sil = isDigitalZero(L0, R0);
+                    pktCodec = sil ? CODEC_SILENCE : CODEC_BFP8;
+                    payloadLen = encodeFrame(L0, R0, pktCodec, pktBuf, WOB_HDR_LEN, scratchQ);
+
+                    int cs = pktFrameSeq & (RETX_CACHE_SLOTS - 1);
+                    cacheSeq[cs] = pktFrameSeq; cacheCodec[cs] = pktCodec; cacheLen[cs] = payloadLen;
+                    if (payloadLen > 0) System.arraycopy(pktBuf, WOB_HDR_LEN, cacheBytes[cs], 0, payloadLen);
+                    frameSeq++;
+                } else {
+                    int r1Idx = r0Idx + 1;
+                    int slot1 = r1Idx & (CAPTURE_RING_SLOTS - 1);
+                    short[] L1 = capRingL[slot1];
+                    short[] R1 = capRingR[slot1];
+                    capReadIdx = r0Idx + 2;
+
+                    boolean sil0 = isDigitalZero(L0, R0);
+                    boolean sil1 = isDigitalZero(L1, R1);
+
+                    if (sil0 && sil1) {
+                        pktCodec = CODEC_SILENCE;
+                        payloadLen = 0;
+                        int cs0 = pktFrameSeq & (RETX_CACHE_SLOTS - 1);
+                        cacheSeq[cs0] = pktFrameSeq; cacheCodec[cs0] = CODEC_SILENCE; cacheLen[cs0] = 0;
+                        int cs1 = (pktFrameSeq + 1) & (RETX_CACHE_SLOTS - 1);
+                        cacheSeq[cs1] = pktFrameSeq + 1; cacheCodec[cs1] = CODEC_SILENCE; cacheLen[cs1] = 0;
+                    } else {
+                        pktCodec = CODEC_BFP6;
+                        int len0 = encodeFrame(L0, R0, CODEC_BFP6, pktBuf, WOB_HDR_LEN, scratchQ);
+                        int len1 = encodeFrame(L1, R1, CODEC_BFP6, pktBuf, WOB_HDR_LEN + len0, scratchQ);
+                        payloadLen = len0 + len1;
+
+                        int cs0 = pktFrameSeq & (RETX_CACHE_SLOTS - 1);
+                        cacheSeq[cs0] = pktFrameSeq; cacheCodec[cs0] = CODEC_BFP6; cacheLen[cs0] = len0;
+                        System.arraycopy(pktBuf, WOB_HDR_LEN, cacheBytes[cs0], 0, len0);
+                        int cs1 = (pktFrameSeq + 1) & (RETX_CACHE_SLOTS - 1);
+                        cacheSeq[cs1] = pktFrameSeq + 1; cacheCodec[cs1] = CODEC_BFP6; cacheLen[cs1] = len1;
+                        System.arraycopy(pktBuf, WOB_HDR_LEN + len0, cacheBytes[cs1], 0, len1);
+                    }
+                    frameSeq += 2;
+                }
+
+                int flagsByte = (pktCodec & 0x07) | ((framesNeeded & 0x03) << 3) | ((activeTier & 0x01) << 6);
+
+                pktBB.clear();
+                pktBB.putShort(WOB6_MAGIC);
+                pktBB.put((byte) TYPE_DATA);
+                pktBB.put((byte) flagsByte);
+                pktBB.putInt(pktFrameSeq);
+                pktBB.putInt(fecBasePkt);
+                pktBB.put((byte) fecIdx);
+                pktBB.put((byte) fecK);
+                pktBB.putShort((short) payloadLen);
+                pktBB.putInt(sessionTag);
+
+                outPkt.setData(pktBuf, 0, WOB_HDR_LEN + payloadLen);
+                outPkt.setAddress(targetAddr);
+                outPkt.setPort(TARGET_PORT);
+                try {
+                    sock.send(outPkt);
+                    lastKeepAliveMs = now;
+                } catch (Exception ignored) {}
+
+                if (fecK >= 2) {
+                    int totalXorSpan = 7 + payloadLen;
+                    if (totalXorSpan > xorMaxLen) xorMaxLen = totalXorSpan;
+
+                    xorBuf[0] ^= (byte) flagsByte;
+                    xorBuf[1] ^= (byte) (pktFrameSeq & 0xFF);
+                    xorBuf[2] ^= (byte) ((pktFrameSeq >> 8) & 0xFF);
+                    xorBuf[3] ^= (byte) ((pktFrameSeq >> 16) & 0xFF);
+                    xorBuf[4] ^= (byte) ((pktFrameSeq >> 24) & 0xFF);
+                    xorBuf[5] ^= (byte) (payloadLen & 0xFF);
+                    xorBuf[6] ^= (byte) ((payloadLen >> 8) & 0xFF);
+                    for (int k = 0; k < payloadLen; k++) {
+                        xorBuf[7 + k] ^= pktBuf[WOB_HDR_LEN + k];
+                    }
+
+                    fecIdx++;
+                    if (fecIdx >= fecK) {
+                        fecBB.clear();
+                        fecBB.putShort(WOB6_MAGIC);
+                        fecBB.put((byte) TYPE_FEC_XOR);
+                        fecBB.put((byte) ((activeTier & 0x01) << 6));
+                        fecBB.putInt(0);
+                        fecBB.putInt(fecBasePkt);
+                        fecBB.put((byte) fecK);
+                        fecBB.put((byte) fecK);
+                        fecBB.putShort((short) xorMaxLen);
+                        fecBB.putInt(sessionTag);
+                        System.arraycopy(xorBuf, 0, fecPktBuf, WOB_HDR_LEN, xorMaxLen);
+
+                        fecOutPkt.setData(fecPktBuf, 0, WOB_HDR_LEN + xorMaxLen);
+                        fecOutPkt.setAddress(targetAddr);
+                        fecOutPkt.setPort(TARGET_PORT);
+                        try { sock.send(fecOutPkt); } catch (Exception ignored) {}
+                        fecIdx = 0;
+                    }
+                }
+                pktSeq++;
             }
         } catch (Exception e) {
-            Log.e(TAG, "Sender fatal error: " + e.getMessage(), e);
+            Log.e(TAG, "Sender error: " + e.getMessage(), e);
         } finally {
             cleanup();
         }
     }
 
-    private boolean sendControlPing(byte[] pingBuf, ByteBuffer pingBB, int sessionTag) {
-        if (serverProtoVersion == 4 && udpSocket != null) {
-            try {
+    private void sendPing(byte[] pingBuf, ByteBuffer pingBB, int sessionTag) {
+        DatagramSocket s = udpSocket;
+        if (s == null || s.isClosed() || targetAddr == null) return;
+        try {
+            if (serverProtoVersion == 4) {
                 byte[] p4 = new byte[]{0x4E, 0x41, 0, 0};
-                udpSocket.send(new DatagramPacket(p4, p4.length, targetAddr, TARGET_PORT));
-                return true;
-            } catch (Exception ignored) { return false; }
-        }
-
-        pingBB.clear();
-        pingBB.putShort(WOB6_MAGIC);
-        pingBB.put((byte) TYPE_PING);
-        pingBB.put((byte) 0);
-        pingBB.putInt(0);
-        pingBB.putInt(0);
-        pingBB.put((byte) 0);
-        pingBB.put((byte) 0);
-        pingBB.putShort((short) 0);
-        pingBB.putInt(sessionTag);
-
-        if (useTcpMode) {
-            OutputStream out = tcpOut;
-            if (out == null) return false;
-            try {
-                writeInFlightStartMs = System.currentTimeMillis();
-                out.write(pingBuf, 0, WOB_HDR_LEN);
-                out.flush();
-                writeInFlightStartMs = 0;
-                return true;
-            } catch (IOException e) {
-                writeInFlightStartMs = 0;
-                return false;
+                s.send(new DatagramPacket(p4, p4.length, targetAddr, TARGET_PORT));
+            } else {
+                pingBB.clear();
+                pingBB.putShort(WOB6_MAGIC);
+                pingBB.put((byte) TYPE_PING);
+                pingBB.put((byte) 0);
+                pingBB.putInt(0);
+                pingBB.putInt(0);
+                pingBB.put((byte) 0);
+                pingBB.put((byte) 0);
+                pingBB.putShort((short) 0);
+                pingBB.putInt(sessionTag);
+                s.send(new DatagramPacket(pingBuf, WOB_HDR_LEN, targetAddr, TARGET_PORT));
             }
-        } else if (udpSocket != null && !udpSocket.isClosed() && targetAddr != null) {
-            try {
-                udpSocket.send(new DatagramPacket(pingBuf, WOB_HDR_LEN, targetAddr, TARGET_PORT));
-                return true;
-            } catch (Exception ignored) {}
-        }
-        return false;
+        } catch (Exception ignored) {}
     }
 
-    private void processPendingUdpNacks(int[] cacheSeq, int[] cacheCodec, byte[][] cacheBytes,
-                                        int[] cacheLen, long[] cacheLastResent,
-                                        byte[] pktBuf, ByteBuffer pktBB, DatagramPacket outPkt,
-                                        int sessionTag, long now) {
+    private void processPendingNacks(int[] cacheSeq, int[] cacheCodec, byte[][] cacheBytes,
+                                     int[] cacheLen, long[] cacheLastResent,
+                                     byte[] pktBuf, ByteBuffer pktBB, DatagramPacket outPkt,
+                                     int sessionTag, long now) {
+        DatagramSocket s = udpSocket;
+        if (s == null || s.isClosed()) return;
         while (true) {
             int base, mask;
             synchronized (nackLock) {
@@ -1236,7 +1086,7 @@ public class AudioCaptureService extends Service {
                 int reqSeq = base + k;
                 int cs = reqSeq & (RETX_CACHE_SLOTS - 1);
                 if (cacheSeq[cs] != reqSeq) continue;
-                if (now - cacheLastResent[cs] < 28) continue;
+                if (now - cacheLastResent[cs] < 35) continue;
                 cacheLastResent[cs] = now;
 
                 int codec = cacheCodec[cs];
@@ -1258,107 +1108,76 @@ public class AudioCaptureService extends Service {
                 outPkt.setData(pktBuf, 0, WOB_HDR_LEN + len);
                 outPkt.setAddress(targetAddr);
                 outPkt.setPort(TARGET_PORT);
-                try { udpSocket.send(outPkt); } catch (Exception ignored) {}
+                try { s.send(outPkt); } catch (Exception ignored) {}
             }
         }
     }
 
-    private void handleAckMessage(String msg, long now) {
-        if (msg.startsWith("NA_NACK:")) {
-            lastAckTime = now;
-            String[] parts = msg.split(":");
-            if (parts.length >= 3) {
-                try {
-                    int baseSeq = (int) Long.parseLong(parts[1].trim());
-                    int mask = (int) Long.parseLong(parts[2].trim(), 16);
-                    synchronized (nackLock) {
-                        int nextTail = (pendingNackTail + 1) & (MAX_PENDING_NACKS - 1);
-                        if (nextTail != pendingNackHead) {
-                            pendingNackBase[pendingNackTail] = baseSeq;
-                            pendingNackMask[pendingNackTail] = mask;
-                            pendingNackTail = nextTail;
-                        }
-                    }
-                    synchronized (captureLock) { captureLock.notify(); }
-                    lastStressEventMs = now;
-                    desiredTier = 1;
-                } catch (Exception ignored) {}
-            }
-        } else if (msg.startsWith("NA_ACK") || msg.startsWith("NA_OFFER")) {
-            lastAckTime = now;
-            if (msg.startsWith("NA_ACK:")) {
-                String[] p = msg.split(":");
-                if (p.length >= 5) {
-                    try {
-                        float targetBufMs = Float.parseFloat(p[2]);
-                        float lossPct = Float.parseFloat(p[3]);
-                        float jitterMs = Float.parseFloat(p[4]);
-                        if (jitterMs >= 18.0f || targetBufMs >= 750.0f || lossPct > 0.5f) {
-                            lastStressEventMs = now;
-                            desiredTier = 1; // Step smoothly into BFP6 Dual-Pack (62.5 pps)
-                        }
-                    } catch (Exception ignored) {}
-                }
-            }
-            if (!isStreamConfirmed || connectionState != STATE_CONNECTED) {
-                isStreamConfirmed = true;
-                String mode = useTcpMode ? "TCP Blindado" : "UDP";
-                updateState(STATE_CONNECTED, "Conectado a REAPER (" + targetIpStr + ") - " + mode);
-            }
-        }
-    }
+    private void runAckAndNackListener() {
+        byte[] recvBuf = new byte[256];
+        DatagramPacket recvPkt = new DatagramPacket(recvBuf, recvBuf.length);
 
-    private void runAckListener() {
-        byte[] lineBuf = new byte[256];
-        int lineLen = 0;
-
-        if (useTcpMode) {
-            while (isCapturing && useTcpMode && tcpSocket != null && !tcpSocket.isClosed()) {
+        while (isCapturing && udpSocket != null && !udpSocket.isClosed()) {
+            try {
+                udpSocket.receive(recvPkt);
+                String msg = new String(recvPkt.getData(), 0, recvPkt.getLength()).trim();
                 long now = System.currentTimeMillis();
-                // Blocked-write watchdog: if kernel TCP send hangs > 3.5s, kill socket immediately so sender recovers cleanly
-                long wStart = writeInFlightStartMs;
-                if (wStart > 0 && (now - wStart) > 3500) {
-                    Log.w(TAG, "Watchdog closing stalled TCP socket after 3.5s blocked write");
-                    try { tcpSocket.close(); } catch (Exception ignored) {}
-                    break;
-                }
 
-                try {
-                    InputStream in = tcpIn;
-                    if (in == null) break;
-                    int b = in.read();
-                    if (b < 0) {
-                        // Clean EOF by peer
-                        break;
+                if (msg.startsWith("NA_NACK:")) {
+                    lastAckTime = now;
+                    String[] parts = msg.split(":");
+                    if (parts.length >= 3) {
+                        try {
+                            int baseSeq = (int) Long.parseLong(parts[1].trim());
+                            int mask = (int) Long.parseLong(parts[2].trim(), 16);
+                            synchronized (nackLock) {
+                                int nextTail = (pendingNackTail + 1) & (MAX_PENDING_NACKS - 1);
+                                if (nextTail != pendingNackHead) {
+                                    pendingNackBase[pendingNackTail] = baseSeq;
+                                    pendingNackMask[pendingNackTail] = mask;
+                                    pendingNackTail = nextTail;
+                                }
+                            }
+                            synchronized (captureLock) { captureLock.notify(); }
+                            lastStressEventMs = now;
+                            desiredTier = 1;
+                        } catch (Exception ignored) {}
                     }
-                    if (b == '\n') {
-                        if (lineLen > 0) {
-                            String line = new String(lineBuf, 0, lineLen).trim();
-                            handleAckMessage(line, System.currentTimeMillis());
-                            lineLen = 0;
+                } else if (msg.startsWith("NA_ACK") || msg.startsWith("NA_OFFER")) {
+                    lastAckTime = now;
+
+                    String fromIp = recvPkt.getAddress().getHostAddress();
+                    if (targetIpStr == null || !fromIp.equals(targetIpStr)) {
+                        targetIpStr = fromIp;
+                        targetAddr = recvPkt.getAddress();
+                        if (msg.contains("WOB6") || msg.contains("WOB5")) serverProtoVersion = 6;
+                        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_LAST_IP, fromIp).apply();
+                    }
+
+                    if (msg.startsWith("NA_ACK:")) {
+                        String[] p = msg.split(":");
+                        if (p.length >= 5) {
+                            try {
+                                float targetBufMs = Float.parseFloat(p[2]);
+                                float lossPct = Float.parseFloat(p[3]);
+                                float jitterMs = Float.parseFloat(p[4]);
+                                if (jitterMs >= 18.0f || targetBufMs >= 580.0f || lossPct >= 1.0f) {
+                                    lastStressEventMs = now;
+                                    desiredTier = 1;
+                                }
+                            } catch (Exception ignored) {}
                         }
-                    } else if (b != '\r' && lineLen < lineBuf.length - 1) {
-                        lineBuf[lineLen++] = (byte) b;
                     }
-                } catch (SocketTimeoutException ignored) {
-                    // Normal 350ms read wake-up so watchdog runs cleanly
-                } catch (Exception e) {
-                    break;
+
+                    if (!isStreamConfirmed || connectionState != STATE_CONNECTED) {
+                        isStreamConfirmed = true;
+                        updateState(STATE_CONNECTED, "Conectado a REAPER (" + targetIpStr + ") - UDP Pro");
+                    }
                 }
-            }
-        } else {
-            byte[] recvBuf = new byte[256];
-            DatagramPacket recvPkt = new DatagramPacket(recvBuf, recvBuf.length);
-            while (isCapturing && !useTcpMode && udpSocket != null && !udpSocket.isClosed()) {
-                try {
-                    udpSocket.receive(recvPkt);
-                    String msg = new String(recvPkt.getData(), 0, recvPkt.getLength()).trim();
-                    handleAckMessage(msg, System.currentTimeMillis());
-                } catch (SocketTimeoutException ignored) {
-                } catch (Exception e) {
-                    if (!isCapturing || udpSocket == null || udpSocket.isClosed()) break;
-                    try { Thread.sleep(80); } catch (InterruptedException ignored) { break; }
-                }
+            } catch (SocketTimeoutException ignored) {
+            } catch (Exception e) {
+                if (!isCapturing || udpSocket == null || udpSocket.isClosed()) break;
+                try { Thread.sleep(80); } catch (InterruptedException ignored) { break; }
             }
         }
     }
@@ -1385,7 +1204,15 @@ public class AudioCaptureService extends Service {
             audioRecord = null;
         }
 
-        closeTransportQuietly();
+        if (udpSocket != null && !udpSocket.isClosed()) {
+            try { udpSocket.close(); } catch (Exception ignored) {}
+            udpSocket = null;
+        }
+
+        if (ackThread != null) {
+            try { ackThread.interrupt(); } catch (Exception ignored) {}
+            ackThread = null;
+        }
 
         if (captureThread != null) {
             try { captureThread.interrupt(); } catch (Exception ignored) {}
