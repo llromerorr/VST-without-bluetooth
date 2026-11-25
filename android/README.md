@@ -1,18 +1,16 @@
-# WOB 5.0 - App Android (Universal: Android 5.0 a 15+)
+# WOB 6.0 - App Android (Universal: Android 5.0 a 15+)
 
-Aplicación emisora de nivel broadcast para **WOB 5.0 (Without Bluetooth)**. Captura el audio digital interno del sistema y lo transmite hacia REAPER / DAW con arquitectura multi-hilo desacoplada, protección contra saturación Wi-Fi y auto-adaptación transparente.
+Aplicación emisora para **WOB 6.0 (Without Bluetooth)** diseñada para transmisión en vivo sin cortes en auditorios e iglesias congestionadas.
 
-## Novedades en la Versión 5.0
-- **Arquitectura Desacoplada sin Bloqueos (Zero-GC):** Hilo dedicado de captura separado del hilo de red UDP mediante anillo en memoria (`512 ms`) para impedir pérdidas de muestras cuando el chip Wi-Fi sufre contención.
-- **Compresión Auto-Adaptativa BFP-8 / BFP-6 + XOR FEC:** Reduce a más de la mitad la tasa de paquetes por segundo (`62.5 pps` en modo congestionado) y añade paquetes de paridad XOR para curar pérdidas en 0 ms.
-- **Caché de Retransmisión Selectiva (`NA_NACK`):** Conserva ~2 segundos de tramas codificadas en memoria y responde al instante a solicitudes `NA_NACK` desde REAPER.
-- **Aislamiento de Red Wi-Fi + Prioridad WMM QoS:** Vincula explícitamente el socket UDP al transporte Wi-Fi/Ethernet (`Network.bindSocket`) evitando saltos a datos móviles 4G/5G y marca tráfico con prioridad `DSCP EF` (`0xB8`).
-- **Descubrimiento Limpio Multi-Subred:** Soporte automático de subredes `/22`, `/23`, `/24` y USB Tethering sin tormentas ARP sobre redes ocupadas.
-- **Volumen Seguro y Notificación Clara:** Inicia siempre en `65%` al conectar y muestra `Volumen: XX%` de forma directa en la notificación con botones compactos `[-]`/`[+]`.
+## Novedades en la Versión 6.0
+- **Transporte TCP Inteligente (0% pérdida):** Descubre REAPER por UDP (`58200`) y abre un flujo **TCP optimizado** (`TCP_NODELAY`, `DSCP EF QoS`, `SO_SNDBUF=64KB`) para entregar el 100% del audio sin generar tráfico extra de paridad ni tormentas NACK. Incluye respaldo UDP automático.
+- **Watchdog Anti-Congelamiento + Auto-Reconexión:** Si el Wi-Fi bloquea un envío > 3.5 s, reinicia el enlace limpiamente manteniendo la captura de audio activa sin volver a pedir permisos.
+- **Compresión Adaptativa BFP-8 / BFP-6 + Silencio:** Reduce el envío a `~600 kbps` (`62.5 pps`) en redes saturadas y `~10 kbps` durante silencios digitales.
+- **Aislamiento de Red Wi-Fi / Ethernet:** Fija los sockets directamente sobre la interfaz local (`Network.getSocketFactory()` / `bindSocket`) evitando saltos silenciosos a 4G/5G.
+- **Volumen Seguro (65%) y Notificación Limpia:** Muestra `Volumen: XX%` visible de inmediato con controles `[-]` / `[+]`.
 
 ## Compilación
-Requiere **Android SDK Build-Tools** y **JDK**:
 ```cmd
 build_apk.bat
 ```
-Generará `bin\WOB-5.0.apk` y `bin\WOB.apk`.
+Generará `bin\WOB-6.0.apk` y `bin\WOB.apk`.

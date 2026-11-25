@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ========================================================
-echo   WOB 5.0 (Without Bluetooth) - Android APK Build Script
+echo   WOB 6.0 (Without Bluetooth) - Android APK Build Script
 echo ========================================================
 
 REM Configure paths according to your environment
@@ -37,8 +37,8 @@ echo [1/6] Compiling resources...
 "%AAPT2%" compile --dir "%APP_DIR%src\main\res" -o "%BUILD_DIR%\resources.zip"
 if %ERRORLEVEL% NEQ 0 goto err
 
-echo [2/6] Linking APK (minSdk 21, targetSdk 34, version 5.0)...
-"%AAPT2%" link -I "%PLATFORM%" --manifest "%APP_DIR%src\main\AndroidManifest.xml" --min-sdk-version 21 --target-sdk-version 34 --version-code 50 --version-name "5.0" --java "%GEN_DIR%" -o "%BUILD_DIR%\base.apk" "%BUILD_DIR%\resources.zip" --auto-add-overlay
+echo [2/6] Linking APK (minSdk 21, targetSdk 34, version 6.0)...
+"%AAPT2%" link -I "%PLATFORM%" --manifest "%APP_DIR%src\main\AndroidManifest.xml" --min-sdk-version 21 --target-sdk-version 34 --version-code 60 --version-name "6.0" --java "%GEN_DIR%" -o "%BUILD_DIR%\base.apk" "%BUILD_DIR%\resources.zip" --auto-add-overlay
 if %ERRORLEVEL% NEQ 0 goto err
 
 echo [3/6] Compiling Java sources...
@@ -58,16 +58,16 @@ popd
 
 echo [6/6] Zipaligning and Signing (v1, v2, v3)...
 "%ZIPALIGN%" -f -p 4 "%BUILD_DIR%\base.apk" "%BUILD_DIR%\aligned.apk"
-call "%APKSIGNER%" sign --ks "%DEBUG_KEYSTORE%" --ks-pass pass:android --key-pass pass:android --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --out "%APP_DIR%bin\WOB-5.0.apk" "%BUILD_DIR%\aligned.apk"
+call "%APKSIGNER%" sign --ks "%DEBUG_KEYSTORE%" --ks-pass pass:android --key-pass pass:android --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --out "%APP_DIR%bin\WOB-6.0.apk" "%BUILD_DIR%\aligned.apk"
 
-copy /y "%APP_DIR%bin\WOB-5.0.apk" "%APP_DIR%bin\WOB.apk" >nul 2>nul
-copy /y "%APP_DIR%bin\WOB-5.0.apk" "C:\Users\Luis Romero\Desktop\WOB-5.0.apk" >nul 2>nul
+copy /y "%APP_DIR%bin\WOB-6.0.apk" "%APP_DIR%bin\WOB.apk" >nul 2>nul
+copy /y "%APP_DIR%bin\WOB-6.0.apk" "C:\Users\Luis Romero\Desktop\WOB-6.0.apk" >nul 2>nul
 
 if %ERRORLEVEL% EQU 0 (
     echo.
     echo ========================================================
-    echo   [SUCCESS] APK created: %APP_DIR%bin\WOB-5.0.apk
-    echo   Copied to: C:\Users\Luis Romero\Desktop\WOB-5.0.apk
+    echo   [SUCCESS] APK created: %APP_DIR%bin\WOB-6.0.apk
+    echo   Copied to: C:\Users\Luis Romero\Desktop\WOB-6.0.apk
     echo ========================================================
     exit /b 0
 )

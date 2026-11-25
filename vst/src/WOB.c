@@ -60,15 +60,16 @@ struct AEffect {
 #pragma pack(pop)
 
 // =========================================================================
-// WOB 5.0 Protocol & Audio Engine Constants
+// WOB 6.0 Broadcast Audio Constants (TCP Smart Stream + Large Cushion)
 // =========================================================================
 #define DEFAULT_PORT      58200
+#define WOB6_MAGIC        0x3657  // 'W6'
 #define WOB5_MAGIC        0x3557  // 'W5'
 #define WOB4_MAGIC        0x4E41  // 'NA' legacy
 
-#define WOB5_TYPE_DATA    1
-#define WOB5_TYPE_FEC_XOR 2
-#define WOB5_TYPE_PING    3
+#define WOB_TYPE_DATA     1
+#define WOB_TYPE_FEC_XOR  2
+#define WOB_TYPE_PING     3
 
 #define CODEC_SILENCE     0
 #define CODEC_BFP8        1
@@ -78,7 +79,7 @@ struct AEffect {
 #define INPUT_SAMPLE_RATE 48000.0
 #define FRAME_SAMPLES     384     // Exact 8.0 ms at 48kHz (24 blocks * 16 samples)
 #define NUM_BLOCKS        24
-#define FRAME_RING_SLOTS  512     // 512 * 8ms = 4.096s slot ring history
+#define FRAME_RING_SLOTS  1024    // 1024 * 8ms = 8.192 seconds slot history
 #define FRAME_RING_MASK   (FRAME_RING_SLOTS - 1)
 #define MAX_CLIENTS       4
 
@@ -86,9 +87,10 @@ struct AEffect {
 #define FEC_MAX_K         4
 #define FEC_MAX_BUF       1420
 
-#define MIN_BUFFER_MS     160.0f
-#define INIT_BUFFER_MS    220.0f
-#define MAX_BUFFER_MS     850.0f
+// True large protective buffer (starts solid at 600ms, auto-expands up to 1500ms)
+#define MIN_BUFFER_MS     500.0f
+#define INIT_BUFFER_MS    600.0f
+#define MAX_BUFFER_MS     1500.0f
 
 static double g_qpcFreqInvMs = 0.0;
 
@@ -155,6 +157,8 @@ typedef struct {
 
 typedef struct {
     bool active;
+    bool isTcp;
+    SOCKET tcpSock;
     uint32_t clientIP;
     uint16_t clientPort;
     struct sockaddr_in lastAddr;
@@ -172,7 +176,6 @@ typedef struct {
 
     // Sequence & Playback coordinates
     volatile uint32_t highestSeq;
-    volatile uint32_t earliestSeq;
     volatile uint32_t curReadSeq;
     uint32_t lastInOrderSeq;
     uint8_t lastInOrderCount;
@@ -186,20 +189,22 @@ typedef struct {
     // Telemetry & Auto-adaptation
     float netTargetBufferMs;
     volatile float starveBoostMs;
+    volatile float realBufferMs;
     float currentJitterMs;
-    uint8_t currentTier;         // 0=HD(BFP8), 1=ChurchArmored(BFP6+K3), 2=Survival(BFP6+K2)
+    uint8_t currentTier;         // 0=BFP8 HD, 1=BFP6 Dual-Pack
     uint32_t packetsReceived;
     uint32_t fecRecovered;
     uint32_t nackSentCount;
     uint32_t nackRecovered;
+    volatile uint32_t dropoutsCount;
 
-    // Sliding 2-second loss tracking window
-    uint32_t winExpected;
-    uint32_t winLossEvents;
+    // Accurate packet loss tracking (strictly 0..100%)
+    uint32_t winExpectedFrames;
+    uint32_t winLostFrames;
     double winStartMs;
-    float lossPermille;
+    float lossPercent;
 
-    // Missing frame tracking for Selective NACK
+    // Missing frame tracking for UDP fallback NACK
     double firstMissedMs[FRAME_RING_SLOTS];
     double lastNackMs[FRAME_RING_SLOTS];
 
@@ -211,28 +216,32 @@ typedef struct {
     float plcBufL[FRAME_SAMPLES];
     float plcBufR[FRAME_SAMPLES];
 
-    // Silence detection cache & click-free fadeout tail
+    // Silence gap cushion expansion & click-free fadeout
     int32_t silenceHoldSamples;
     int32_t silenceCooldownSamples;
     uint32_t lastCheckedSilSeq;
     float lastOutL;
     float lastOutR;
 
-    // FEC recovery buckets
+    // FEC buckets (UDP fallback)
     FecBucket fecBuckets[FEC_BUCKETS];
 
-    // 512 * 8ms = 4.096 seconds lock-free slot ring
+    // 1024 * 8ms = 8.192 seconds lock-free slot ring
     AudioSlot slots[FRAME_RING_SLOTS];
 
-    // Legacy WOB 4.0 support counter
-    uint16_t legacyWriteSeq;
+    // Legacy WOB 4.0 fallback
     uint32_t legacySampleAcc;
 } ClientStream;
 
 typedef struct {
-    SOCKET sock;
-    HANDLE threadHandle;
+    SOCKET udpSock;
+    SOCKET tcpListenSock;
+    HANDLE udpThreadHandle;
+    HANDLE tcpAcceptThreadHandle;
+    CRITICAL_SECTION netLock;
     volatile bool running;
+    volatile bool netInitialized;
+    volatile LONG activeTcpThreads;
 
     ClientStream* clients;
     int activeClientCount;
@@ -249,6 +258,12 @@ typedef struct {
     UINT_PTR timerId;
     struct ERect editorRect;
 } PluginState;
+
+typedef struct {
+    PluginState* state;
+    SOCKET clientSock;
+    struct sockaddr_in clientAddr;
+} TcpClientArg;
 
 static PluginState g_state;
 static ClientStream g_clientStorage[MAX_CLIENTS];
@@ -278,7 +293,7 @@ static void detectLocalIp(char* outIp, size_t outSize) {
     }
 }
 
-static void resetClientSession(ClientStream* c, uint32_t newSessionTag, uint32_t firstSeq, double nowMs) {
+static void resetClientSession(ClientStream* c, uint32_t newSessionTag, uint32_t firstSeq, double nowMs, bool isTcp, SOCKET tcpSock) {
     c->resetting = true;
     MemoryBarrier();
 
@@ -301,9 +316,10 @@ static void resetClientSession(ClientStream* c, uint32_t newSessionTag, uint32_t
     c->lastOutL = 0.0f;
     c->lastOutR = 0.0f;
 
+    c->isTcp = isTcp;
+    c->tcpSock = tcpSock;
     c->sessionTag = newSessionTag;
     c->highestSeq = firstSeq;
-    c->earliestSeq = firstSeq;
     c->curReadSeq = firstSeq;
     c->lastInOrderSeq = firstSeq;
     c->lastInOrderCount = 1;
@@ -320,17 +336,18 @@ static void resetClientSession(ClientStream* c, uint32_t newSessionTag, uint32_t
     c->lastNackScanMs = nowMs;
     c->netTargetBufferMs = INIT_BUFFER_MS;
     c->starveBoostMs = INIT_BUFFER_MS;
+    c->realBufferMs = 0.0f;
     c->currentJitterMs = 0.0f;
     c->currentTier = 0;
     c->packetsReceived = 0;
     c->fecRecovered = 0;
     c->nackSentCount = 0;
     c->nackRecovered = 0;
-    c->winExpected = 0;
-    c->winLossEvents = 0;
+    c->dropoutsCount = 0;
+    c->winExpectedFrames = 0;
+    c->winLostFrames = 0;
     c->winStartMs = nowMs;
-    c->lossPermille = 0.0f;
-    c->legacyWriteSeq = 0;
+    c->lossPercent = 0.0f;
     c->legacySampleAcc = 0;
 
     MemoryBarrier();
@@ -338,21 +355,38 @@ static void resetClientSession(ClientStream* c, uint32_t newSessionTag, uint32_t
     c->resetting = false;
 }
 
-static ClientStream* getClientStream(PluginState* state, struct sockaddr_in* addr, double nowMs) {
+static ClientStream* getClientStream(PluginState* state, struct sockaddr_in* addr, double nowMs, bool isTcp, SOCKET tcpSock) {
     uint32_t ip = addr->sin_addr.s_addr;
 
     for (int i = 0; i < MAX_CLIENTS; ++i) {
         if (state->clients[i].active && state->clients[i].clientIP == ip) {
-            state->clients[i].lastSeenMs = nowMs;
-            state->clients[i].clientPort = ntohs(addr->sin_port);
-            state->clients[i].lastAddr = *addr;
-            return &state->clients[i];
+            ClientStream* c = &state->clients[i];
+            c->lastSeenMs = nowMs;
+            c->clientPort = ntohs(addr->sin_port);
+            c->lastAddr = *addr;
+            if (isTcp && tcpSock != INVALID_SOCKET && c->tcpSock != tcpSock) {
+                if (c->tcpSock != INVALID_SOCKET) {
+                    closesocket(c->tcpSock);
+                }
+                c->tcpSock = tcpSock;
+                c->isTcp = true;
+            } else if (!isTcp) {
+                if (c->tcpSock != INVALID_SOCKET) {
+                    closesocket(c->tcpSock);
+                    c->tcpSock = INVALID_SOCKET;
+                }
+                c->isTcp = false;
+            }
+            return c;
         }
     }
 
     for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (!state->clients[i].active || (nowMs - state->clients[i].lastSeenMs) > 5000.0) {
+        if (!state->clients[i].active || (nowMs - state->clients[i].lastSeenMs) > 6000.0) {
             ClientStream* c = &state->clients[i];
+            if (c->tcpSock != INVALID_SOCKET && c->tcpSock != tcpSock) {
+                closesocket(c->tcpSock);
+            }
             memset(c, 0, sizeof(ClientStream));
             c->clientIP = ip;
             c->clientPort = ntohs(addr->sin_port);
@@ -362,6 +396,8 @@ static ClientStream* getClientStream(PluginState* state, struct sockaddr_in* add
             c->netTargetBufferMs = INIT_BUFFER_MS;
             c->starveBoostMs = INIT_BUFFER_MS;
             c->prebuffering = true;
+            c->isTcp = isTcp;
+            c->tcpSock = tcpSock;
             c->active = true;
             return c;
         }
@@ -435,7 +471,6 @@ static bool writeDecodedFrameToSlot(ClientStream* c, uint32_t frameSeq, uint8_t 
     uint32_t slotIdx = frameSeq & FRAME_RING_MASK;
     AudioSlot* slot = &c->slots[slotIdx];
 
-    // Idempotent check: already have this exact frame
     if (slot->ready && slot->seq == frameSeq) {
         return false;
     }
@@ -483,8 +518,7 @@ static bool writeDecodedFrameToSlot(ClientStream* c, uint32_t frameSeq, uint8_t 
     return true;
 }
 
-static void recordLossAndExpandCushion(ClientStream* c, double nowMs, float amountMs, float capMs) {
-    c->winLossEvents++;
+static void expandCushion(ClientStream* c, double nowMs, float amountMs, float capMs) {
     c->lastStressMs = nowMs;
     if (c->netTargetBufferMs < capMs) {
         c->netTargetBufferMs += amountMs;
@@ -492,7 +526,7 @@ static void recordLossAndExpandCushion(ClientStream* c, double nowMs, float amou
     }
 }
 
-static bool processWob5DataPayload(ClientStream* c, uint8_t flags, uint32_t frameSeq, const uint8_t* payload, uint16_t payloadLen, double nowMs, bool fromFec) {
+static bool processDataPayload(ClientStream* c, uint8_t flags, uint32_t frameSeq, const uint8_t* payload, uint16_t payloadLen, double nowMs, bool fromFec) {
     uint8_t codec = flags & 0x07;
     uint8_t frameCount = ((flags >> 3) & 0x03);
     if (frameCount < 1) frameCount = 1;
@@ -501,11 +535,10 @@ static bool processWob5DataPayload(ClientStream* c, uint8_t flags, uint32_t fram
     uint8_t tier = (flags >> 6) & 0x03;
     c->currentTier = tier;
 
-    // Check if frame is already way in the past relative to playback
     if (c->streamInit && !c->prebuffering) {
         uint32_t curR = c->curReadSeq;
         if (frameSeq + frameCount <= curR && (curR - (frameSeq + frameCount)) < 10000u) {
-            return false; // Too late, discard cleanly without warping timing
+            return false; // Late frame already passed playback
         }
     }
 
@@ -522,35 +555,35 @@ static bool processWob5DataPayload(ClientStream* c, uint8_t flags, uint32_t fram
 
     bool burstGapDetected = false;
 
-    // Update highestSeq and track any missing sequence holes
     if (!c->streamInit) {
         c->highestSeq = frameSeq + frameCount - 1;
         c->streamInit = true;
     } else if (frameSeq + frameCount - 1 > c->highestSeq) {
         uint32_t prevHigh = c->highestSeq;
         uint32_t gap = frameSeq - (prevHigh + 1);
-        if (gap > 0 && gap <= 64) {
+        if (!c->isTcp && gap > 0 && gap <= 64) {
             if (gap >= 3) burstGapDetected = true;
             for (uint32_t s = prevHigh + 1; s < frameSeq; ++s) {
                 uint32_t sl = s & FRAME_RING_MASK;
                 if (!(c->slots[sl].ready && c->slots[sl].seq == s)) {
                     if (c->firstMissedMs[sl] == 0.0) {
-                        // Burst gaps (3+ frames) cannot be solved by 1-pkt XOR FEC -> schedule instant 0ms NACK!
                         c->firstMissedMs[sl] = (gap >= 3) ? (nowMs - 25.0) : nowMs;
                         c->lastNackMs[sl] = 0.0;
                     }
                 }
             }
         }
-        c->winExpected += (gap < 64) ? (gap + frameCount) : frameCount;
+        c->winExpectedFrames += (gap < 64) ? (gap + frameCount) : frameCount;
         c->highestSeq = frameSeq + frameCount - 1;
+    } else {
+        c->winExpectedFrames += frameCount;
     }
 
     for (uint8_t f = 0; f < frameCount; ++f) {
         writeDecodedFrameToSlot(c, frameSeq + f, codec, payload + f * expectedPerFrame, expectedPerFrame, isRetransmit);
     }
 
-    // High-precision jitter measurement only on sequential fresh DATA packets
+    // High-precision arrival jitter tracking (ONLY updates cushion, NEVER pollutes packet loss!)
     if (!isRetransmit && !fromFec) {
         if (c->lastPacketArrivalMs > 0.0 && frameSeq == c->lastInOrderSeq + c->lastInOrderCount) {
             double deltaMs = nowMs - c->lastPacketArrivalMs;
@@ -558,8 +591,9 @@ static bool processWob5DataPayload(ClientStream* c, uint8_t flags, uint32_t fram
             float instantJitter = (float)fabs(deltaMs - expectedMs);
             c->currentJitterMs = c->currentJitterMs * 0.90f + instantJitter * 0.10f;
 
-            if (instantJitter > 14.0f) {
-                recordLossAndExpandCushion(c, nowMs, 35.0f, 550.0f);
+            // Real heavy Wi-Fi stall (> 30ms jitter): expand cushion up toward 1500ms
+            if (instantJitter > 30.0f) {
+                expandCushion(c, nowMs, 60.0f, MAX_BUFFER_MS);
             }
         }
         c->lastPacketArrivalMs = nowMs;
@@ -570,7 +604,7 @@ static bool processWob5DataPayload(ClientStream* c, uint8_t flags, uint32_t fram
 }
 
 // =========================================================================
-// XOR Parity FEC Recovery (0-ms / zero-NACK recovery for 1-in-K drops)
+// UDP Fallback XOR FEC & NACK Helpers
 // =========================================================================
 static FecBucket* findOrAllocFecBucket(ClientStream* c, uint32_t sessionTag, uint32_t fecBase, uint8_t fecK, double nowMs) {
     int oldestIdx = 0;
@@ -630,18 +664,18 @@ static void tryRecoverFecBucket(ClientStream* c, FecBucket* b, double nowMs) {
     b->repaired = true;
     if (recPayloadLen + 7 <= b->parityLen && recPayloadLen <= 1360) {
         c->fecRecovered++;
-        recordLossAndExpandCushion(c, nowMs, 8.0f, 360.0f);
-        processWob5DataPayload(c, recFlags, recFrameSeq, recBuf + 7, recPayloadLen, nowMs, true);
+        expandCushion(c, nowMs, 25.0f, 1200.0f);
+        processDataPayload(c, recFlags, recFrameSeq, recBuf + 7, recPayloadLen, nowMs, true);
     }
 }
 
-static void scanAndSendNacks(ClientStream* c, SOCKET sock, double nowMs) {
-    if (!c->streamInit || c->highestSeq <= c->curReadSeq + 1) return;
+static void scanAndSendNacks(ClientStream* c, SOCKET udpSock, double nowMs) {
+    if (c->isTcp || !c->streamInit || c->highestSeq <= c->curReadSeq + 1) return;
 
     uint32_t curR = c->curReadSeq;
     uint32_t start = curR + 1;
-    if (c->highestSeq > 96 && c->highestSeq - start > 96) {
-        start = c->highestSeq - 96;
+    if (c->highestSeq > 128 && c->highestSeq - start > 128) {
+        start = c->highestSeq - 128;
     }
 
     uint32_t baseSeq = 0;
@@ -650,7 +684,7 @@ static void scanAndSendNacks(ClientStream* c, SOCKET sock, double nowMs) {
         uint32_t sl = s & FRAME_RING_MASK;
         if (!(c->slots[sl].ready && c->slots[sl].seq == s)) {
             if (c->firstMissedMs[sl] > 0.0 && (nowMs - c->firstMissedMs[sl]) >= 20.0) {
-                if (c->lastNackMs[sl] == 0.0 || (nowMs - c->lastNackMs[sl]) >= 32.0) {
+                if (c->lastNackMs[sl] == 0.0 || (nowMs - c->lastNackMs[sl]) >= 35.0) {
                     baseSeq = s;
                     foundBase = true;
                     break;
@@ -668,7 +702,7 @@ static void scanAndSendNacks(ClientStream* c, SOCKET sock, double nowMs) {
         uint32_t sl = s & FRAME_RING_MASK;
         if (!(c->slots[sl].ready && c->slots[sl].seq == s)) {
             if (c->firstMissedMs[sl] > 0.0 && (nowMs - c->firstMissedMs[sl]) >= 16.0) {
-                if (c->lastNackMs[sl] == 0.0 || (nowMs - c->lastNackMs[sl]) >= 32.0) {
+                if (c->lastNackMs[sl] == 0.0 || (nowMs - c->lastNackMs[sl]) >= 35.0) {
                     mask |= (1u << k);
                     c->lastNackMs[sl] = nowMs;
                 }
@@ -679,40 +713,183 @@ static void scanAndSendNacks(ClientStream* c, SOCKET sock, double nowMs) {
     if (mask != 0) {
         char nackMsg[64];
         snprintf(nackMsg, sizeof(nackMsg), "NA_NACK:%u:%08X", (unsigned int)baseSeq, (unsigned int)mask);
-        sendto(sock, nackMsg, (int)strlen(nackMsg), 0, (struct sockaddr*)&c->lastAddr, sizeof(c->lastAddr));
+        sendto(udpSock, nackMsg, (int)strlen(nackMsg), 0, (struct sockaddr*)&c->lastAddr, sizeof(c->lastAddr));
         c->nackSentCount++;
-        recordLossAndExpandCushion(c, nowMs, 45.0f, 650.0f);
+        expandCushion(c, nowMs, 60.0f, MAX_BUFFER_MS);
     }
 }
 
-static void sendAckTelemetry(ClientStream* c, SOCKET sock, double nowMs) {
+static void sendAckTelemetry(ClientStream* c, SOCKET udpSock, double nowMs) {
     float effTarget = (c->starveBoostMs > c->netTargetBufferMs) ? c->starveBoostMs : c->netTargetBufferMs;
     if (effTarget > MAX_BUFFER_MS) effTarget = MAX_BUFFER_MS;
 
+    // Calculate true unrecovered frame loss percentage cleanly (strictly clamped 0..100%)
     if ((nowMs - c->winStartMs) >= 2000.0) {
-        if (c->winExpected > 10) {
-            float perm = ((float)c->winLossEvents * 1000.0f) / (float)c->winExpected;
-            c->lossPermille = c->lossPermille * 0.5f + perm * 0.5f;
+        uint32_t denom = c->winExpectedFrames;
+        if (denom < c->winLostFrames) denom = c->winLostFrames;
+        if (denom > 0) {
+            float rawPct = ((float)c->winLostFrames * 100.0f) / (float)denom;
+            if (rawPct > 100.0f) rawPct = 100.0f;
+            c->lossPercent = c->lossPercent * 0.4f + rawPct * 0.6f;
         } else {
-            c->lossPermille *= 0.5f;
+            c->lossPercent *= 0.5f;
         }
-        c->winExpected = 0;
-        c->winLossEvents = 0;
+        c->winExpectedFrames = 0;
+        c->winLostFrames = 0;
         c->winStartMs = nowMs;
     }
 
-    char ackMsg[128];
-    snprintf(ackMsg, sizeof(ackMsg), "NA_ACK:%u:%.0f:%.1f:%.1f:%u:%u",
+    char ackMsg[160];
+    // Format: NA_ACK:<packetsRecv>:<targetBufMs>:<lossPercent>:<jitterMs>:<realBufMs>:<transport>\n
+    snprintf(ackMsg, sizeof(ackMsg), "NA_ACK:%u:%.0f:%.1f:%.1f:%.0f:%s\n",
              (unsigned int)c->packetsReceived,
              effTarget,
-             c->lossPermille,
+             c->lossPercent,
              c->currentJitterMs,
-             (unsigned int)c->fecRecovered,
-             (unsigned int)c->nackRecovered);
-    sendto(sock, ackMsg, (int)strlen(ackMsg), 0, (struct sockaddr*)&c->lastAddr, sizeof(c->lastAddr));
+             c->realBufferMs,
+             c->isTcp ? "TCP" : "UDP");
+
+    int len = (int)strlen(ackMsg);
+    if (c->isTcp && c->tcpSock != INVALID_SOCKET) {
+        send(c->tcpSock, ackMsg, len, 0);
+    } else if (udpSock != INVALID_SOCKET) {
+        sendto(udpSock, ackMsg, len - 1, 0, (struct sockaddr*)&c->lastAddr, sizeof(c->lastAddr));
+    }
     c->lastAckMs = nowMs;
 }
 
+// =========================================================================
+// TCP Exact Framing Reader & Client Thread
+// =========================================================================
+static bool recvExact(SOCKET s, uint8_t* dst, int len, volatile bool* running) {
+    int got = 0;
+    while (got < len && *running) {
+        int r = recv(s, (char*)(dst + got), len - got, 0);
+        if (r > 0) {
+            got += r;
+        } else if (r == 0) {
+            return false; // Clean TCP close by phone
+        } else {
+            int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+                continue; // Keep waiting as long as running
+            }
+            return false;
+        }
+    }
+    return (got == len);
+}
+
+static DWORD WINAPI tcpClientThread(LPVOID param) {
+    TcpClientArg* arg = (TcpClientArg*)param;
+    PluginState* state = arg->state;
+    SOCKET sock = arg->clientSock;
+    struct sockaddr_in addr = arg->clientAddr;
+    free(arg);
+
+    InterlockedIncrement(&state->activeTcpThreads);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    int nodelay = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+    int rcvBuf = 512 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvBuf, sizeof(rcvBuf));
+    DWORD timeout = 250;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+    uint8_t hdr[20];
+    uint8_t payload[2048];
+    ClientStream* myClient = NULL;
+
+    while (state->running) {
+        if (!recvExact(sock, hdr, 20, &state->running)) {
+            break;
+        }
+
+        uint16_t magic = rd16(hdr);
+        if (magic != WOB6_MAGIC && magic != WOB5_MAGIC) {
+            break; // Invalid framing -> abort socket cleanly
+        }
+
+        uint8_t type = hdr[2];
+        uint8_t flags = hdr[3];
+        uint32_t frameSeq = rd32(hdr + 4);
+        uint16_t payloadLen = rd16(hdr + 14);
+        uint32_t sessionTag = rd32(hdr + 16);
+
+        if (payloadLen > 1600) {
+            break; // Protect buffer bounds
+        }
+
+        if (payloadLen > 0) {
+            if (!recvExact(sock, payload, payloadLen, &state->running)) {
+                break;
+            }
+        }
+
+        double nowMs = getTimeMs();
+        EnterCriticalSection(&state->netLock);
+        myClient = getClientStream(state, &addr, nowMs, true, sock);
+
+        if (!myClient->streamInit || myClient->sessionTag != sessionTag) {
+            resetClientSession(myClient, sessionTag, frameSeq, nowMs, true, sock);
+        }
+
+        if (type == WOB_TYPE_PING) {
+            sendAckTelemetry(myClient, INVALID_SOCKET, nowMs);
+        } else if (type == WOB_TYPE_DATA) {
+            myClient->packetsReceived++;
+            processDataPayload(myClient, flags, frameSeq, payload, payloadLen, nowMs, false);
+            if ((nowMs - myClient->lastAckMs) >= 220.0) {
+                sendAckTelemetry(myClient, INVALID_SOCKET, nowMs);
+            }
+        }
+        LeaveCriticalSection(&state->netLock);
+    }
+
+    EnterCriticalSection(&state->netLock);
+    if (myClient && myClient->tcpSock == sock) {
+        myClient->tcpSock = INVALID_SOCKET;
+    }
+    LeaveCriticalSection(&state->netLock);
+    closesocket(sock);
+    InterlockedDecrement(&state->activeTcpThreads);
+    return 0;
+}
+
+static DWORD WINAPI tcpAcceptorThread(LPVOID param) {
+    PluginState* state = (PluginState*)param;
+    while (state->running && state->tcpListenSock != INVALID_SOCKET) {
+        struct sockaddr_in clientAddr;
+        int addrLen = sizeof(clientAddr);
+        SOCKET cSock = accept(state->tcpListenSock, (struct sockaddr*)&clientAddr, &addrLen);
+        if (cSock == INVALID_SOCKET) {
+            if (!state->running) break;
+            Sleep(20);
+            continue;
+        }
+        TcpClientArg* arg = (TcpClientArg*)malloc(sizeof(TcpClientArg));
+        if (!arg) {
+            closesocket(cSock);
+            continue;
+        }
+        arg->state = state;
+        arg->clientSock = cSock;
+        arg->clientAddr = clientAddr;
+        HANDLE h = CreateThread(NULL, 0, tcpClientThread, arg, 0, NULL);
+        if (h) {
+            CloseHandle(h);
+        } else {
+            free(arg);
+            closesocket(cSock);
+        }
+    }
+    return 0;
+}
+
+// =========================================================================
+// UDP Discovery Responder + Fallback Audio Receiver + Periodic Monitor
+// =========================================================================
 static DWORD WINAPI udpReceiverThread(LPVOID param) {
     PluginState* state = (PluginState*)param;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -722,25 +899,23 @@ static DWORD WINAPI udpReceiverThread(LPVOID param) {
 
     while (state->running) {
         int clientLen = sizeof(clientAddr);
-        int bytes = recvfrom(state->sock, (char*)buffer, sizeof(buffer), 0, (struct sockaddr*)&clientAddr, &clientLen);
+        int bytes = recvfrom(state->udpSock, (char*)buffer, sizeof(buffer), 0, (struct sockaddr*)&clientAddr, &clientLen);
         double nowMs = getTimeMs();
 
         if (bytes > 0) {
-            // 1. Discovery Handshake
+            // 1. Discovery Handshake (advertises WOB6 TCP+UDP capabilities)
             if (bytes >= 11 && memcmp(buffer, "NA_DISCOVER", 11) == 0) {
-                const char* reply = "NA_OFFER:WOB5";
-                sendto(state->sock, reply, (int)strlen(reply), 0, (struct sockaddr*)&clientAddr, clientLen);
+                const char* reply = "NA_OFFER:WOB6";
+                sendto(state->udpSock, reply, (int)strlen(reply), 0, (struct sockaddr*)&clientAddr, clientLen);
                 continue;
             }
 
             if (bytes >= 4) {
                 uint16_t magic = rd16(buffer);
-                ClientStream* c = getClientStream(state, &clientAddr, nowMs);
+                EnterCriticalSection(&state->netLock);
+                ClientStream* c = getClientStream(state, &clientAddr, nowMs, false, INVALID_SOCKET);
 
-                // =========================================================
-                // WOB 5.0 Packet (magic == 0x3557, 20-byte header)
-                // =========================================================
-                if (magic == WOB5_MAGIC && bytes >= 20) {
+                if ((magic == WOB6_MAGIC || magic == WOB5_MAGIC) && bytes >= 20) {
                     uint8_t type = buffer[2];
                     uint8_t flags = buffer[3];
                     uint32_t frameSeq = rd32(buffer + 4);
@@ -751,170 +926,207 @@ static DWORD WINAPI udpReceiverThread(LPVOID param) {
                     uint32_t sessionTag = rd32(buffer + 16);
 
                     if (!c->streamInit || c->sessionTag != sessionTag) {
-                        resetClientSession(c, sessionTag, frameSeq, nowMs);
+                        resetClientSession(c, sessionTag, frameSeq, nowMs, false, INVALID_SOCKET);
                     }
 
-                    if (type == WOB5_TYPE_PING) {
-                        sendAckTelemetry(c, state->sock, nowMs);
-                        continue;
-                    }
-
-                    if (20 + (int)payloadLen > bytes) continue;
-                    const uint8_t* payload = buffer + 20;
-
-                    if (type == WOB5_TYPE_DATA) {
-                        c->packetsReceived++;
-
-                        // Store in XOR FEC bucket if FEC is enabled
-                        if (fecK >= 2 && fecK <= FEC_MAX_K && fecIndex < fecK && ((flags & 0x20) == 0)) {
-                            if (7 + payloadLen <= FEC_MAX_BUF) {
-                                FecBucket* b = findOrAllocFecBucket(c, sessionTag, fecBase, fecK, nowMs);
-                                if (!b->hasSlot[fecIndex]) {
-                                    b->slotData[fecIndex][0] = flags;
-                                    memcpy(b->slotData[fecIndex] + 1, buffer + 4, 4); // frameSeq LE
-                                    memcpy(b->slotData[fecIndex] + 5, buffer + 14, 2); // payloadLen LE
-                                    if (payloadLen > 0) {
-                                        memcpy(b->slotData[fecIndex] + 7, payload, payloadLen);
+                    if (type == WOB_TYPE_PING) {
+                        sendAckTelemetry(c, state->udpSock, nowMs);
+                    } else if (20 + (int)payloadLen <= bytes) {
+                        const uint8_t* payload = buffer + 20;
+                        if (type == WOB_TYPE_DATA) {
+                            c->packetsReceived++;
+                            if (fecK >= 2 && fecK <= FEC_MAX_K && fecIndex < fecK && ((flags & 0x20) == 0)) {
+                                if (7 + payloadLen <= FEC_MAX_BUF) {
+                                    FecBucket* b = findOrAllocFecBucket(c, sessionTag, fecBase, fecK, nowMs);
+                                    if (!b->hasSlot[fecIndex]) {
+                                        b->slotData[fecIndex][0] = flags;
+                                        memcpy(b->slotData[fecIndex] + 1, buffer + 4, 4);
+                                        memcpy(b->slotData[fecIndex] + 5, buffer + 14, 2);
+                                        if (payloadLen > 0) memcpy(b->slotData[fecIndex] + 7, payload, payloadLen);
+                                        b->slotLen[fecIndex] = (uint16_t)(7 + payloadLen);
+                                        b->hasSlot[fecIndex] = true;
+                                        b->receivedCount++;
+                                        tryRecoverFecBucket(c, b, nowMs);
                                     }
-                                    b->slotLen[fecIndex] = (uint16_t)(7 + payloadLen);
-                                    b->hasSlot[fecIndex] = true;
-                                    b->receivedCount++;
-                                    tryRecoverFecBucket(c, b, nowMs);
                                 }
                             }
-                        }
-
-                        if (processWob5DataPayload(c, flags, frameSeq, payload, payloadLen, nowMs, false)) {
-                            // Burst gap detected! Dispatch selective NACK immediately (0ms delay)!
-                            c->lastNackScanMs = nowMs;
-                            scanAndSendNacks(c, state->sock, nowMs);
-                        }
-                    } else if (type == WOB5_TYPE_FEC_XOR) {
-                        if (fecK >= 2 && fecK <= FEC_MAX_K && payloadLen >= 7 && payloadLen <= FEC_MAX_BUF) {
-                            FecBucket* b = findOrAllocFecBucket(c, sessionTag, fecBase, fecK, nowMs);
-                            memcpy(b->parityData, payload, payloadLen);
-                            b->parityLen = payloadLen;
-                            b->hasParity = true;
-                            tryRecoverFecBucket(c, b, nowMs);
-                        }
-                    }
-                }
-                // =========================================================
-                // Legacy WOB 4.0 Support (magic == 0x4E41)
-                // =========================================================
-                else if (magic == WOB4_MAGIC) {
-                    if (bytes == 4) {
-                        sendAckTelemetry(c, state->sock, nowMs);
-                        continue;
-                    }
-                    int samples = (bytes - 4) / 2;
-                    int frames = samples / 2; // usually 240
-                    if (frames > 0 && frames <= FRAME_SAMPLES) {
-                        if (!c->streamInit || c->sessionTag != 0x4E410000u) {
-                            resetClientSession(c, 0x4E410000u, 0, nowMs);
-                        }
-                        c->packetsReceived++;
-                        const int16_t* pcm = (const int16_t*)(buffer + 4);
-                        for (int i = 0; i < frames; ++i) {
-                            uint32_t seq = c->legacySampleAcc / FRAME_SAMPLES;
-                            uint32_t off = c->legacySampleAcc % FRAME_SAMPLES;
-                            uint32_t sl = seq & FRAME_RING_MASK;
-                            c->slots[sl].L[off] = (float)pcm[i * 2] / 32768.0f;
-                            c->slots[sl].R[off] = (float)pcm[i * 2 + 1] / 32768.0f;
-                            if (off == FRAME_SAMPLES - 1) {
-                                c->slots[sl].seq = seq;
-                                MemoryBarrier();
-                                c->slots[sl].ready = true;
-                                c->highestSeq = seq;
+                            if (processDataPayload(c, flags, frameSeq, payload, payloadLen, nowMs, false)) {
+                                c->lastNackScanMs = nowMs;
+                                scanAndSendNacks(c, state->udpSock, nowMs);
                             }
-                            c->legacySampleAcc++;
+                        } else if (type == WOB_TYPE_FEC_XOR) {
+                            if (fecK >= 2 && fecK <= FEC_MAX_K && payloadLen >= 7 && payloadLen <= FEC_MAX_BUF) {
+                                FecBucket* b = findOrAllocFecBucket(c, sessionTag, fecBase, fecK, nowMs);
+                                memcpy(b->parityData, payload, payloadLen);
+                                b->parityLen = payloadLen;
+                                b->hasParity = true;
+                                tryRecoverFecBucket(c, b, nowMs);
+                            }
+                        }
+                    }
+                } else if (magic == WOB4_MAGIC) {
+                    if (bytes == 4) {
+                        sendAckTelemetry(c, state->udpSock, nowMs);
+                    } else {
+                        int samples = (bytes - 4) / 2;
+                        int frames = samples / 2;
+                        if (frames > 0 && frames <= FRAME_SAMPLES) {
+                            if (!c->streamInit || c->sessionTag != 0x4E410000u) {
+                                resetClientSession(c, 0x4E410000u, 0, nowMs, false, INVALID_SOCKET);
+                            }
+                            c->packetsReceived++;
+                            const int16_t* pcm = (const int16_t*)(buffer + 4);
+                            for (int i = 0; i < frames; ++i) {
+                                uint32_t seq = c->legacySampleAcc / FRAME_SAMPLES;
+                                uint32_t off = c->legacySampleAcc % FRAME_SAMPLES;
+                                uint32_t sl = seq & FRAME_RING_MASK;
+                                c->slots[sl].L[off] = (float)pcm[i * 2] / 32768.0f;
+                                c->slots[sl].R[off] = (float)pcm[i * 2 + 1] / 32768.0f;
+                                if (off == FRAME_SAMPLES - 1) {
+                                    c->slots[sl].seq = seq;
+                                    MemoryBarrier();
+                                    c->slots[sl].ready = true;
+                                    c->highestSeq = seq;
+                                }
+                                c->legacySampleAcc++;
+                            }
                         }
                     }
                 }
+                LeaveCriticalSection(&state->netLock);
             }
         }
 
-        // Periodic telemetry ACKs, NACK scanning & cautious cushion relaxation across active clients
+        // Periodic telemetry & NACK / relaxation monitor across active clients
+        EnterCriticalSection(&state->netLock);
         for (int i = 0; i < MAX_CLIENTS; ++i) {
             ClientStream* c = &state->clients[i];
             if (!c->active || !c->streamInit) continue;
 
-            if ((nowMs - c->lastNackScanMs) >= 15.0) {
+            if (!c->isTcp && (nowMs - c->lastNackScanMs) >= 15.0) {
                 c->lastNackScanMs = nowMs;
-                scanAndSendNacks(c, state->sock, nowMs);
+                scanAndSendNacks(c, state->udpSock, nowMs);
             }
 
             if ((nowMs - c->lastAckMs) >= 220.0) {
-                sendAckTelemetry(c, state->sock, nowMs);
+                sendAckTelemetry(c, state->udpSock, nowMs);
             }
 
-            // Very gradual relaxation ONLY after 30+ seconds of zero stress/loss
-            if ((nowMs - c->lastStressMs) > 30000.0 && c->lossPermille < 1.0f && c->currentJitterMs < 8.0f) {
-                if (c->netTargetBufferMs > 180.0f) {
-                    c->netTargetBufferMs -= 0.015f;
-                    if (c->netTargetBufferMs < 180.0f) c->netTargetBufferMs = 180.0f;
+            // Very gradual relaxation down toward INIT_BUFFER_MS (600ms) only after 45s calm network
+            if ((nowMs - c->lastStressMs) > 45000.0 && c->lossPercent < 0.2f && c->currentJitterMs < 15.0f) {
+                if (c->netTargetBufferMs > INIT_BUFFER_MS) {
+                    c->netTargetBufferMs -= 0.02f;
+                    if (c->netTargetBufferMs < INIT_BUFFER_MS) c->netTargetBufferMs = INIT_BUFFER_MS;
                 }
-                if (c->starveBoostMs > 180.0f) {
-                    c->starveBoostMs -= 0.015f;
-                    if (c->starveBoostMs < 180.0f) c->starveBoostMs = 180.0f;
+                if (c->starveBoostMs > INIT_BUFFER_MS) {
+                    c->starveBoostMs -= 0.02f;
+                    if (c->starveBoostMs < INIT_BUFFER_MS) c->starveBoostMs = INIT_BUFFER_MS;
                 }
             }
         }
+        LeaveCriticalSection(&state->netLock);
     }
     return 0;
 }
 
 static void startNetworking(PluginState* state) {
+    InitializeCriticalSection(&state->netLock);
+    state->netInitialized = true;
+    state->activeTcpThreads = 0;
+
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
 
     detectLocalIp(state->localIpStr, sizeof(state->localIpStr));
 
-    state->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (state->sock == INVALID_SOCKET) return;
+    // 1. Setup UDP Discovery + Fallback socket
+    state->udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (state->udpSock != INVALID_SOCKET) {
+        int rcvBuf = 2 * 1024 * 1024;
+        setsockopt(state->udpSock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvBuf, sizeof(rcvBuf));
+        int sndBuf = 512 * 1024;
+        setsockopt(state->udpSock, SOL_SOCKET, SO_SNDBUF, (char*)&sndBuf, sizeof(sndBuf));
+        DWORD timeout = 15;
+        setsockopt(state->udpSock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+        int broadcast = 1;
+        setsockopt(state->udpSock, SOL_SOCKET, SO_BROADCAST, (char*)&broadcast, sizeof(broadcast));
+        int reuse = 1;
+        setsockopt(state->udpSock, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
 
-    int rcvBuf = 2 * 1024 * 1024;
-    setsockopt(state->sock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvBuf, sizeof(rcvBuf));
+        struct sockaddr_in bindAddr;
+        memset(&bindAddr, 0, sizeof(bindAddr));
+        bindAddr.sin_family = AF_INET;
+        bindAddr.sin_port = htons(DEFAULT_PORT);
+        bindAddr.sin_addr.s_addr = INADDR_ANY;
 
-    int sndBuf = 512 * 1024;
-    setsockopt(state->sock, SOL_SOCKET, SO_SNDBUF, (char*)&sndBuf, sizeof(sndBuf));
+        if (bind(state->udpSock, (struct sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+            closesocket(state->udpSock);
+            state->udpSock = INVALID_SOCKET;
+        }
+    }
 
-    DWORD timeout = 15; // 15ms polling interval for fast NACK recovery
-    setsockopt(state->sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    // 2. Setup TCP Broadcast Stream Listener on same port 58200
+    state->tcpListenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (state->tcpListenSock != INVALID_SOCKET) {
+        int reuse = 1;
+        setsockopt(state->tcpListenSock, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
 
-    int broadcast = 1;
-    setsockopt(state->sock, SOL_SOCKET, SO_BROADCAST, (char*)&broadcast, sizeof(broadcast));
+        struct sockaddr_in tcpBind;
+        memset(&tcpBind, 0, sizeof(tcpBind));
+        tcpBind.sin_family = AF_INET;
+        tcpBind.sin_port = htons(DEFAULT_PORT);
+        tcpBind.sin_addr.s_addr = INADDR_ANY;
 
-    int reuse = 1;
-    setsockopt(state->sock, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
-
-    struct sockaddr_in bindAddr;
-    memset(&bindAddr, 0, sizeof(bindAddr));
-    bindAddr.sin_family = AF_INET;
-    bindAddr.sin_port = htons(DEFAULT_PORT);
-    bindAddr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(state->sock, (struct sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-        closesocket(state->sock);
-        state->sock = INVALID_SOCKET;
-        return;
+        if (bind(state->tcpListenSock, (struct sockaddr*)&tcpBind, sizeof(tcpBind)) == SOCKET_ERROR ||
+            listen(state->tcpListenSock, 8) == SOCKET_ERROR) {
+            closesocket(state->tcpListenSock);
+            state->tcpListenSock = INVALID_SOCKET;
+        }
     }
 
     state->running = true;
-    state->threadHandle = CreateThread(NULL, 0, udpReceiverThread, state, 0, NULL);
+    if (state->udpSock != INVALID_SOCKET) {
+        state->udpThreadHandle = CreateThread(NULL, 0, udpReceiverThread, state, 0, NULL);
+    }
+    if (state->tcpListenSock != INVALID_SOCKET) {
+        state->tcpAcceptThreadHandle = CreateThread(NULL, 0, tcpAcceptorThread, state, 0, NULL);
+    }
 }
 
 static void stopNetworking(PluginState* state) {
+    if (!state->netInitialized) return;
+    state->netInitialized = false;
     state->running = false;
-    if (state->sock != INVALID_SOCKET) {
-        closesocket(state->sock);
-        state->sock = INVALID_SOCKET;
+    if (state->udpSock != INVALID_SOCKET) {
+        closesocket(state->udpSock);
+        state->udpSock = INVALID_SOCKET;
     }
-    if (state->threadHandle) {
-        WaitForSingleObject(state->threadHandle, 500);
-        CloseHandle(state->threadHandle);
-        state->threadHandle = NULL;
+    if (state->tcpListenSock != INVALID_SOCKET) {
+        closesocket(state->tcpListenSock);
+        state->tcpListenSock = INVALID_SOCKET;
     }
+    if (state->clients) {
+        for (int i = 0; i < MAX_CLIENTS; ++i) {
+            if (state->clients[i].tcpSock != INVALID_SOCKET) {
+                closesocket(state->clients[i].tcpSock);
+                state->clients[i].tcpSock = INVALID_SOCKET;
+            }
+        }
+    }
+    if (state->udpThreadHandle) {
+        WaitForSingleObject(state->udpThreadHandle, 600);
+        CloseHandle(state->udpThreadHandle);
+        state->udpThreadHandle = NULL;
+    }
+    if (state->tcpAcceptThreadHandle) {
+        WaitForSingleObject(state->tcpAcceptThreadHandle, 600);
+        CloseHandle(state->tcpAcceptThreadHandle);
+        state->tcpAcceptThreadHandle = NULL;
+    }
+    for (int w = 0; w < 60 && state->activeTcpThreads > 0; ++w) {
+        Sleep(10);
+    }
+    DeleteCriticalSection(&state->netLock);
     WSACleanup();
 }
 
@@ -924,7 +1136,6 @@ static void stopNetworking(PluginState* state) {
 static void synthesizePlcFrame(ClientStream* c, uint32_t missingSeq) {
     c->plcSynthSeq = missingSeq;
 
-    // Quick pitch lag search (64..200 samples -> 240Hz..750Hz) over recent clean history
     uint32_t w = c->plcWritePos;
     int bestLag = 128;
     double bestScore = -1e18;
@@ -942,7 +1153,6 @@ static void synthesizePlcFrame(ClientStream* c, uint32_t missingSeq) {
         }
     }
 
-    // Check if future slot (missingSeq + 1) exists for clean tail crossfade
     AudioSlot* nextSlot = &c->slots[(missingSeq + 1) & FRAME_RING_MASK];
     bool hasNext = (nextSlot->ready && nextSlot->seq == missingSeq + 1);
 
@@ -955,7 +1165,6 @@ static void synthesizePlcFrame(ClientStream* c, uint32_t missingSeq) {
         float sL = c->plcHistL[idx] * damp;
         float sR = c->plcHistR[idx] * damp;
 
-        // Smooth 32-sample crossfade into next packet start if already present!
         if (hasNext && i >= FRAME_SAMPLES - 32) {
             float t = (float)(i - (FRAME_SAMPLES - 32)) / 32.0f;
             int nIdx = i - (FRAME_SAMPLES - 32);
@@ -1007,7 +1216,7 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
         ClientStream* c = &state->clients[ci];
         if (!c->active) continue;
 
-        if ((nowMs - c->lastSeenMs) > 5000.0) {
+        if ((nowMs - c->lastSeenMs) > 6000.0) {
             c->active = false;
             c->fadeVolume = 0.0f;
             continue;
@@ -1024,9 +1233,16 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
         uint32_t hiSeq = c->highestSeq;
         uint64_t hiSampleEnd = ((uint64_t)hiSeq + 1ULL) * (uint64_t)FRAME_SAMPLES;
 
-        // Pre-buffering / Clean Re-buffering State
+        // Track live real buffer fill in ms accurately
+        if (hiSampleEnd > (uint64_t)c->readGlobalSample) {
+            c->realBufferMs = (float)((double)(hiSampleEnd - (uint64_t)c->readGlobalSample) * 1000.0 / INPUT_SAMPLE_RATE);
+        } else {
+            c->realBufferMs = 0.0f;
+        }
+
+        // Pre-buffering / Clean Re-buffering State: wait for FULL real target cushion!
         if (c->prebuffering) {
-            uint32_t prebufGoal = (c->packetsReceived < 50 && c->starveBoostMs <= INIT_BUFFER_MS)
+            uint32_t prebufGoal = (c->packetsReceived < 90 && c->starveBoostMs <= INIT_BUFFER_MS)
                                 ? (uint32_t)(INPUT_SAMPLE_RATE * (INIT_BUFFER_MS / 1000.0f))
                                 : targetSamples;
             if (hiSampleEnd > (uint64_t)c->readGlobalSample) {
@@ -1034,16 +1250,9 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
                 if (avail >= (uint64_t)prebufGoal) {
                     uint64_t anchor = hiSampleEnd - (uint64_t)prebufGoal;
                     uint32_t anchorSeq = (uint32_t)(anchor / FRAME_SAMPLES);
-                    // Wait until at least 2 consecutive slots at playhead are present
-                    if (c->slots[anchorSeq & FRAME_RING_MASK].ready && c->slots[anchorSeq & FRAME_RING_MASK].seq == anchorSeq &&
-                        c->slots[(anchorSeq + 1) & FRAME_RING_MASK].ready && c->slots[(anchorSeq + 1) & FRAME_RING_MASK].seq == anchorSeq + 1) {
-                        c->readGlobalSample = (double)anchor;
-                        c->curReadSeq = anchorSeq;
-                        c->prebuffering = false;
-                        c->smoothedDiffSamples = 0.0;
-                        c->consecutivePlcFrames = 0;
-                    } else if (avail > (uint64_t)prebufGoal + FRAME_SAMPLES * 4ULL) {
-                        // Skip over initial hole if frames ahead already piled up
+                    if ((c->slots[anchorSeq & FRAME_RING_MASK].ready && c->slots[anchorSeq & FRAME_RING_MASK].seq == anchorSeq &&
+                         c->slots[(anchorSeq + 1) & FRAME_RING_MASK].ready && c->slots[(anchorSeq + 1) & FRAME_RING_MASK].seq == anchorSeq + 1) ||
+                        avail > (uint64_t)prebufGoal + FRAME_SAMPLES * 4ULL) {
                         c->readGlobalSample = (double)anchor;
                         c->curReadSeq = anchorSeq;
                         c->prebuffering = false;
@@ -1055,25 +1264,25 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
             continue;
         }
 
-        // Trim runaway stale latency (> target + 550ms backlog)
+        // Anti-Bufferbloat guard: trim stale backlog ONLY if persistently > target + 900ms (~2.4s max!)
         if (hiSampleEnd > (uint64_t)c->readGlobalSample) {
             double availNow = (double)hiSampleEnd - c->readGlobalSample;
-            if (availNow > (double)targetSamples + INPUT_SAMPLE_RATE * 0.55) {
+            if (availNow > (double)targetSamples + INPUT_SAMPLE_RATE * 0.90) {
                 c->readGlobalSample = (double)(hiSampleEnd - (uint64_t)targetSamples);
-                c->fadeVolume = 0.0f; // brief soft crossfade-in on jump
+                c->fadeVolume = 0.0f;
             }
         }
 
-        // Smooth clock drift steering (+0.5% catch-up, -0.8% imperceptible cushion growth)
+        // Smooth imperceptible clock drift steering (+0.4% catch-up, -0.6% quiet cushion growth)
         double availSamples = (hiSampleEnd > (uint64_t)c->readGlobalSample) ? ((double)hiSampleEnd - c->readGlobalSample) : 0.0;
         double diff = availSamples - (double)targetSamples;
-        c->smoothedDiffSamples = c->smoothedDiffSamples * 0.992 + diff * 0.008;
+        c->smoothedDiffSamples = c->smoothedDiffSamples * 0.994 + diff * 0.006;
 
         double driftFactor = 1.0;
-        if (fabs(c->smoothedDiffSamples) > 480.0) {
-            driftFactor = 1.0 + (c->smoothedDiffSamples / (double)targetSamples) * 0.012;
-            if (driftFactor > 1.005) driftFactor = 1.005;
-            if (driftFactor < 0.992) driftFactor = 0.992;
+        if (fabs(c->smoothedDiffSamples) > 960.0) {
+            driftFactor = 1.0 + (c->smoothedDiffSamples / (double)targetSamples) * 0.010;
+            if (driftFactor > 1.004) driftFactor = 1.004;
+            if (driftFactor < 0.994) driftFactor = 0.994;
         }
         double step = (INPUT_SAMPLE_RATE / (double)hostRate) * driftFactor;
 
@@ -1097,7 +1306,7 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
             uint32_t seq = (uint32_t)(curSampleIdx / FRAME_SAMPLES);
             c->curReadSeq = seq;
 
-            // If we need to grow cushion (diff < -20ms) and current frame is digital silence/quiet gap, pause 1 slot cleanly!
+            // Quiet-gap cushion expansion: expand rapidly in breath/pause gaps (-44dBFS) with 0% pitch change
             AudioSlot* curSlot = &c->slots[seq & FRAME_RING_MASK];
             if (seq != c->lastCheckedSilSeq) {
                 c->lastCheckedSilSeq = seq;
@@ -1109,18 +1318,21 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
                         if (al > maxAmp) maxAmp = al;
                         if (ar > maxAmp) maxAmp = ar;
                     }
-                    if (maxAmp < 0.0025f) {
+                    if (maxAmp < 0.006f) {
                         c->silenceHoldSamples = FRAME_SAMPLES;
-                        c->silenceCooldownSamples = FRAME_SAMPLES * 3;
-                        continue; // Gains +8ms pure cushion in silence with ZERO audio impact!
+                        c->silenceCooldownSamples = FRAME_SAMPLES * 2;
+                        continue;
                     }
                 }
             }
 
             if (curSampleIdx >= hiSampleEnd) {
-                // Buffer starved! Smooth exponential decay -> Rebuffer cleanly instead of stuttering!
+                // Starvation! Smooth fade-out -> Rebuffer directly up to stronger protection level!
+                if (c->fadeVolume == 1.0f || c->fadeVolume > 0.5f) {
+                    c->dropoutsCount++;
+                }
                 if (c->starveBoostMs < MAX_BUFFER_MS) {
-                    c->starveBoostMs += 120.0f;
+                    c->starveBoostMs += 250.0f;
                     if (c->starveBoostMs > MAX_BUFFER_MS) c->starveBoostMs = MAX_BUFFER_MS;
                 }
                 if (c->fadeVolume > 0.005f) {
@@ -1141,15 +1353,15 @@ static void processReplacing(struct AEffect* e, float** in, float** out, int32_t
 
             bool slotPresent = (curSlot->ready && curSlot->seq == seq);
             if (!slotPresent) {
-                // Isolated missing slot while audio exists ahead -> Pitch-Matched PLC!
                 if (c->plcSynthSeq != seq) {
+                    c->winLostFrames++; // True missing frame recorded ONCE
                     if ((int32_t)(hiSeq - seq) >= 1 && c->consecutivePlcFrames < 6) {
                         c->consecutivePlcFrames++;
                         synthesizePlcFrame(c, seq);
                     } else {
-                        // Long consecutive blackout: fade out cleanly into full rebuffer
+                        c->dropoutsCount++;
                         if (c->starveBoostMs < MAX_BUFFER_MS) {
-                            c->starveBoostMs += 120.0f;
+                            c->starveBoostMs += 250.0f;
                             if (c->starveBoostMs > MAX_BUFFER_MS) c->starveBoostMs = MAX_BUFFER_MS;
                         }
                         if (c->fadeVolume > 0.005f) {
@@ -1255,7 +1467,7 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                                           CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
             HFONT oldFont = (HFONT)SelectObject(memDC, hFontTitle);
             SetTextColor(memDC, RGB(0, 220, 200));
-            TextOutA(memDC, 16, 8, "WOB 5.0", 7);
+            TextOutA(memDC, 16, 8, "WOB 6.0", 7);
 
             HFONT hFontSmall = CreateFontA(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -1263,7 +1475,7 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             SelectObject(memDC, hFontSmall);
             SetTextColor(memDC, RGB(130, 130, 140));
             char subTitle[128];
-            snprintf(subTitle, sizeof(subTitle), "Ultra-Broadcast Iglesia  |  IP PC: %s", state->localIpStr);
+            snprintf(subTitle, sizeof(subTitle), "TCP Iglesia Blindado  |  IP PC: %s", state->localIpStr);
             TextOutA(memDC, 88, 12, subTitle, (int)strlen(subTitle));
 
             int count = state->activeClientCount;
@@ -1280,17 +1492,17 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
 
                 if (first) {
-                    const char* tierName = (first->currentTier == 2) ? "SUPERVIVENCIA (BFP6+K2)" :
-                                           (first->currentTier == 1) ? "BLINDADO (BFP6+K3)" : "HD ESTUDIO (BFP8+K4)";
+                    const char* modeName = first->isTcp ? "TCP 0%-Perdida" : "UDP Respaldo";
+                    const char* codecName = (first->currentTier > 0) ? "BFP-6 Compacto" : "BFP-8 HD";
                     float effBuf = (first->starveBoostMs > first->netTargetBufferMs) ? first->starveBoostMs : first->netTargetBufferMs;
-                    snprintf(statusText, sizeof(statusText), "CONECTADO: %s  [%s]", first->ipStr, tierName);
-                    snprintf(infoText, sizeof(infoText), "Bufer: %.0f ms  |  Jitter: %.1f ms  |  Perdida: %.1f%%",
-                             effBuf, first->currentJitterMs, first->lossPermille / 10.0f);
-                    snprintf(infoText2, sizeof(infoText2), "Paquetes: %u  |  Curados FEC: %u  |  NACKs: %u",
-                             (unsigned int)first->packetsReceived, (unsigned int)first->fecRecovered, (unsigned int)first->nackRecovered);
+                    snprintf(statusText, sizeof(statusText), "CONECTADO: %s  [%s | %s]", first->ipStr, modeName, codecName);
+                    snprintf(infoText, sizeof(infoText), "Bufer Real: %.0f / %.0f ms  |  Jitter Red: %.1f ms",
+                             first->realBufferMs, effBuf, first->currentJitterMs);
+                    snprintf(infoText2, sizeof(infoText2), "Paquetes: %u  |  Perdida Real: %.1f%%  |  Cortes: %u",
+                             (unsigned int)first->packetsReceived, first->lossPercent, (unsigned int)first->dropoutsCount);
                 } else {
                     snprintf(statusText, sizeof(statusText), "CONECTADO (En vivo)");
-                    snprintf(infoText, sizeof(infoText), "Escudo Wi-Fi Activo");
+                    snprintf(infoText, sizeof(infoText), "Colchon TCP Activo");
                     snprintf(infoText2, sizeof(infoText2), "Sistema Anti-Cortes en ejecucion");
                 }
                 SetTextColor(memDC, RGB(46, 213, 115));
@@ -1298,7 +1510,7 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 dotBrush = CreateSolidBrush(RGB(255, 160, 40));
                 strcpy(statusText, "ESPERANDO CONEXION DESDE LA APP WOB...");
                 strcpy(infoText, "Abre la app WOB en tu celular y pulsa CONECTAR.");
-                strcpy(infoText2, "Proteccion FEC + NACK + Auto-Bufer lista para Wi-Fi congestionado.");
+                strcpy(infoText2, "Modo TCP + Bufer Grande (600-1500 ms) listo para Wi-Fi lleno.");
                 SetTextColor(memDC, RGB(240, 180, 80));
             }
 
@@ -1322,7 +1534,7 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
             SelectObject(memDC, hFontSmall);
             SetTextColor(memDC, RGB(180, 180, 190));
-            TextOutA(memDC, 28, 82, "TELEMETRIA WI-FI EN VIVO:", 25);
+            TextOutA(memDC, 28, 82, "TELEMETRIA REAL DEL ENLACE:", 27);
 
             HFONT hFontSub = CreateFontA(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -1438,10 +1650,10 @@ static intptr_t dispatcher(struct AEffect* e, int32_t op, int32_t idx, intptr_t 
                 state->hwndEditor = NULL;
             }
             return 0;
-        case 45: if (ptr) { lstrcpyA((char*)ptr, "WOB 5.0"); return 1; } break;
+        case 45: if (ptr) { lstrcpyA((char*)ptr, "WOB 6.0"); return 1; } break;
         case 47: if (ptr) { lstrcpyA((char*)ptr, "WOB Audio"); return 1; } break;
-        case 48: if (ptr) { lstrcpyA((char*)ptr, "WOB 5.0"); return 1; } break;
-        case 49: return 5000;
+        case 48: if (ptr) { lstrcpyA((char*)ptr, "WOB 6.0"); return 1; } break;
+        case 49: return 6000;
         case 58: return 2400;
     }
     return 0;
@@ -1463,7 +1675,10 @@ __declspec(dllexport) struct AEffect* VSTPluginMain(audioMasterCallback audioMas
     initQpc();
     memset(&g_state, 0, sizeof(g_state));
     memset(g_clientStorage, 0, sizeof(g_clientStorage));
+    for (int i = 0; i < MAX_CLIENTS; ++i) g_clientStorage[i].tcpSock = INVALID_SOCKET;
     g_state.clients = g_clientStorage;
+    g_state.udpSock = INVALID_SOCKET;
+    g_state.tcpListenSock = INVALID_SOCKET;
     g_state.hostSampleRate = 44100.0f;
     g_state.masterGain = 1.0f;
 
@@ -1478,7 +1693,7 @@ __declspec(dllexport) struct AEffect* VSTPluginMain(audioMasterCallback audioMas
     g_effect.numInputs = 0;
     g_effect.numOutputs = 2;
     g_effect.uniqueID = 0x574F4250; // 'WOBP'
-    g_effect.version = 5000;
+    g_effect.version = 6000;
     g_effect.flags = (1 << 4) | (1 << 0);
     g_effect.object = &g_state;
 
